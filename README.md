@@ -21,7 +21,7 @@ Your hand-written skill content is never touched. Improvements accumulate in a m
 pip install skillopt
 
 # Clone this repo
-git clone https://github.com/july-ai/hermes-skillopt.git
+git clone https://github.com/JulyBluesGitHub/hermes-skillopt.git
 cd hermes-skillopt
 ```
 
