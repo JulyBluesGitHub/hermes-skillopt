@@ -1,8 +1,8 @@
 """
-Hermes SkillOpt-Sleep — Nightly Runner
+Hermes SkillOpt-Sleep — On-Demand Runner
 
-Runs the sleep cycle for recently-used Hermes skills, staging any
-validated improvements for morning review. Designed to be called from cron.
+Runs the sleep cycle for recently-used Hermes skills and stages
+reviewable improvements. Invoke it explicitly when optimization is wanted.
 
 Usage:
     python -m hermes_skillopt.run_nightly           # all recently-used skills
@@ -12,11 +12,12 @@ Usage:
 
 from __future__ import annotations
 
+import argparse
+import hashlib
 import json
 import os
 import sys
 import time
-import argparse
 from typing import Dict, List, Optional
 
 # Add repo root
@@ -28,9 +29,8 @@ STAGING_ROOT = os.path.join(HERMES_HOME, "skillopt-staging")
 
 
 def recently_used_skills(hermes_home: str = "", lookback_hours: int = 72, max_skills: int = 20) -> List[str]:
-    """Find which skills were loaded in recent Hermes sessions."""
+    """Find skills actually loaded through successful ``skill_view`` calls."""
     import sqlite3
-    import re
 
     db_path = os.path.join(hermes_home or HERMES_HOME, "state.db")
     if not os.path.exists(db_path):
@@ -38,26 +38,40 @@ def recently_used_skills(hermes_home: str = "", lookback_hours: int = 72, max_sk
 
     conn = sqlite3.connect(db_path)
     cutoff = time.time() - (lookback_hours * 3600)
-
-    rows = conn.execute("""
-        SELECT system_prompt FROM sessions
-        WHERE started_at > ? AND system_prompt IS NOT NULL
-        ORDER BY started_at DESC
-    """, (cutoff,)).fetchall()
-
-    skill_counts: Dict[str, int] = {}
-    for (sp,) in rows:
-        if not sp:
-            continue
-        found = re.findall(r'- (\S+):', sp)
-        for skill in found:
-            skill_counts[skill] = skill_counts.get(skill, 0) + 1
-
+    rows = conn.execute(
+        """
+        SELECT m.content
+        FROM sessions AS s
+        JOIN messages AS m ON m.session_id = s.id
+        WHERE s.started_at > ?
+          AND COALESCE(s.archived, 0) = 0
+          AND m.active = 1
+          AND m.role = 'tool'
+          AND m.tool_name = 'skill_view'
+        ORDER BY s.started_at DESC, m.id
+        """,
+        (cutoff,),
+    ).fetchall()
     conn.close()
 
-    # Sort by frequency, most-used first
-    sorted_skills = sorted(skill_counts.items(), key=lambda x: -x[1])
-    return [s for s, _ in sorted_skills[:max_skills]]
+    skill_counts: Dict[str, int] = {}
+    first_seen: Dict[str, int] = {}
+    for index, (content,) in enumerate(rows):
+        try:
+            payload = json.loads(content or "{}")
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict) or payload.get("success") is False:
+            continue
+        skill = payload.get("name")
+        if not isinstance(skill, str) or not skill.strip():
+            continue
+        skill = skill.strip()
+        skill_counts[skill] = skill_counts.get(skill, 0) + 1
+        first_seen.setdefault(skill, index)
+
+    sorted_skills = sorted(skill_counts, key=lambda name: (-skill_counts[name], first_seen[name]))
+    return sorted_skills[:max_skills]
 
 
 def ensure_staging_dir() -> str:
@@ -65,15 +79,24 @@ def ensure_staging_dir() -> str:
     return STAGING_ROOT
 
 
+def _sha256_file(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(65536), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def write_staging_report(
     skill_name: str,
     report: dict,
     proposed_skill: Optional[str],
     live_skill_path: str,
+    staging_root: str = STAGING_ROOT,
 ) -> str:
     """Write one skill's sleep report to staging. Returns staging path."""
     ts = time.strftime("%Y%m%d-%H%M%S")
-    out = os.path.join(STAGING_ROOT, f"{ts}-{skill_name}")
+    out = os.path.join(staging_root, f"{ts}-{skill_name}")
     os.makedirs(out, exist_ok=True)
 
     # Machine-readable report
@@ -139,6 +162,9 @@ def write_staging_report(
         "live_skill_path": live_skill_path,
         "has_proposed": bool(proposed_skill and accepted),
         "accepted": accepted,
+        "status": "staged",
+        "live_skill_sha256": _sha256_file(live_skill_path) if os.path.isfile(live_skill_path) else "",
+        "proposed_skill_sha256": hashlib.sha256((proposed_skill or "").encode("utf-8")).hexdigest(),
         "staged_at": ts,
     }
     with open(os.path.join(out, "manifest.json"), "w", encoding="utf-8") as f:
@@ -147,17 +173,23 @@ def write_staging_report(
     return out
 
 
-def adopt_skill(skill_name: str, staging_dir: str = "") -> bool:
-    """Apply a staged skill improvement to the live skill file.
-
-    Backs up the original first, then copies the proposed version over it.
-    """
+def adopt_skill(skill_name: str, staging_dir: str = "", staging_root: str = STAGING_ROOT) -> bool:
+    """Safely apply the newest exact staged proposal for ``skill_name``."""
     if not staging_dir:
-        # Find the latest staging for this skill
         candidates = []
-        for d in os.listdir(STAGING_ROOT):
-            if d.endswith(f"-{skill_name}"):
-                candidates.append(os.path.join(STAGING_ROOT, d))
+        if os.path.isdir(staging_root):
+            for name in os.listdir(staging_root):
+                candidate = os.path.join(staging_root, name)
+                manifest_path = os.path.join(candidate, "manifest.json")
+                if not os.path.isfile(manifest_path):
+                    continue
+                try:
+                    with open(manifest_path, encoding="utf-8") as handle:
+                        manifest = json.load(handle)
+                except (OSError, json.JSONDecodeError):
+                    continue
+                if manifest.get("skill_name") == skill_name and manifest.get("status", "staged") == "staged":
+                    candidates.append(candidate)
         if not candidates:
             print(f"[skillopt-sleep] No staged proposals for {skill_name}")
             return False
@@ -168,32 +200,77 @@ def adopt_skill(skill_name: str, staging_dir: str = "") -> bool:
         print(f"[skillopt-sleep] No manifest in {staging_dir}")
         return False
 
-    with open(manifest_path) as f:
-        manifest = json.load(f)
+    with open(manifest_path, encoding="utf-8") as handle:
+        manifest = json.load(handle)
 
+    if manifest.get("skill_name") != skill_name:
+        print(f"[skillopt-sleep] Manifest is for {manifest.get('skill_name')}, not {skill_name}")
+        return False
+    if manifest.get("status", "staged") != "staged":
+        print(f"[skillopt-sleep] Proposal for {skill_name} is already {manifest.get('status')}")
+        return False
     if not manifest.get("has_proposed"):
         print(f"[skillopt-sleep] No proposed skill to adopt for {skill_name}")
         return False
 
     live_path = manifest["live_skill_path"]
     proposed_path = os.path.join(staging_dir, "proposed_SKILL.md")
+    expected_live_hash = manifest.get("live_skill_sha256", "")
+    expected_proposed_hash = manifest.get("proposed_skill_sha256", "")
 
-    if not os.path.exists(proposed_path):
-        print(f"[skillopt-sleep] Proposed skill file missing: {proposed_path}")
+    if not os.path.isfile(live_path) or not os.path.isfile(proposed_path):
+        print(f"[skillopt-sleep] Live or proposed skill file is missing for {skill_name}")
+        return False
+    if not expected_live_hash or not expected_proposed_hash:
+        print(f"[skillopt-sleep] Legacy proposal for {skill_name} lacks safety hashes; rerun SkillOpt")
+        return False
+    if _sha256_file(live_path) != expected_live_hash:
+        print(f"[skillopt-sleep] Live skill changed after staging; refusing to overwrite {live_path}")
+        return False
+    if _sha256_file(proposed_path) != expected_proposed_hash:
+        print(f"[skillopt-sleep] Proposed skill hash mismatch; refusing {proposed_path}")
         return False
 
-    # Backup
     import shutil
+
     backup_dir = os.path.join(staging_dir, "backup")
     os.makedirs(backup_dir, exist_ok=True)
-    if os.path.exists(live_path):
-        shutil.copy2(live_path, os.path.join(backup_dir, os.path.basename(live_path)))
-        print(f"[skillopt-sleep] Backed up: {live_path} → {backup_dir}")
-
-    # Apply
+    shutil.copy2(live_path, os.path.join(backup_dir, os.path.basename(live_path)))
     shutil.copy2(proposed_path, live_path)
+
+    manifest["status"] = "adopted"
+    manifest["adopted_at"] = time.strftime("%Y%m%d-%H%M%S")
+    with open(manifest_path, "w", encoding="utf-8") as handle:
+        json.dump(manifest, handle, ensure_ascii=False, indent=2)
+
     print(f"[skillopt-sleep] Adopted: {proposed_path} → {live_path}")
     return True
+
+
+def adopt_staging_dirs(staging_dirs: List[str]) -> int:
+    """Adopt exactly the supplied staging directories, never older proposals."""
+    adopted = 0
+    for staging_dir in staging_dirs:
+        manifest_path = os.path.join(staging_dir, "manifest.json")
+        if not os.path.isfile(manifest_path):
+            continue
+        try:
+            with open(manifest_path, encoding="utf-8") as handle:
+                manifest = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            continue
+        skill_name = manifest.get("skill_name")
+        if isinstance(skill_name, str) and adopt_skill(skill_name, staging_dir=staging_dir):
+            adopted += 1
+    return adopted
+
+
+def adopt_all_staged(staging_root: str = STAGING_ROOT) -> int:
+    """Adopt every valid, still-staged proposal under ``staging_root``."""
+    if not os.path.isdir(staging_root):
+        return 0
+    staging_dirs = [os.path.join(staging_root, name) for name in os.listdir(staging_root)]
+    return adopt_staging_dirs(staging_dirs)
 
 
 def run_nightly(
@@ -207,7 +284,7 @@ def run_nightly(
     dry_run: bool = False,
 ) -> List[dict]:
     """Run sleep cycle for specified skills (or auto-detect recently used ones)."""
-    from hermes_skillopt.sleep import run_hermes_sleep, load_hermes_skill
+    from hermes_skillopt.sleep import run_hermes_sleep
 
     if skills is None:
         skills = recently_used_skills(hermes_home, lookback_hours)
@@ -251,7 +328,6 @@ def run_nightly(
 
         # Stage the proposal
         if not dry_run and report.get("edits") and report.get("accepted"):
-            skill_path = load_hermes_skill(skill_name)  # to find the live path
             # Reconstruct the actual live path
             import glob
             pattern = os.path.join(hermes_home or HERMES_HOME, "skills", "**", skill_name, "SKILL.md")
@@ -274,8 +350,8 @@ def run_nightly(
 
 def main():
     parser = argparse.ArgumentParser(
-        prog="hermes-skillopt-nightly",
-        description="Nightly SkillOpt-Sleep for Hermes Agent"
+        prog="hermes-skillopt",
+        description="On-demand SkillOpt-Sleep for Hermes Agent"
     )
     parser.add_argument("--dry-run", action="store_true", help="Preview without staging")
     parser.add_argument("--skill", action="append", dest="skills",
@@ -297,10 +373,12 @@ def main():
     args = parser.parse_args()
 
     if args.run_and_adopt:
-        # Run pipeline first
+        before = set(os.listdir(STAGING_ROOT)) if os.path.isdir(STAGING_ROOT) else set()
         ret = cmd_run(args)
-        # Then adopt everything that was staged
-        cmd_adopt_all()
+        after = set(os.listdir(STAGING_ROOT)) if os.path.isdir(STAGING_ROOT) else set()
+        new_dirs = [os.path.join(STAGING_ROOT, name) for name in sorted(after - before)]
+        adopted = adopt_staging_dirs(new_dirs)
+        print(f"\n[skillopt-sleep] Adopted {adopted} newly staged skill(s)")
         return ret
     if args.list_staged:
         return cmd_list_staged(args)
@@ -366,19 +444,8 @@ def cmd_adopt(skills: List[str]) -> int:
 
 
 def cmd_adopt_all() -> int:
-    """Adopt all staged proposals."""
-    if not os.path.isdir(STAGING_ROOT):
-        print("[skillopt-sleep] No staged proposals.")
-        return 0
-
-    adopted = 0
-    for d in os.listdir(STAGING_ROOT):
-        parts = d.rsplit("-", 1)
-        if len(parts) == 2:
-            skill = parts[1]
-            if adopt_skill(skill):
-                adopted += 1
-
+    """Adopt all valid staged proposals."""
+    adopted = adopt_all_staged()
     print(f"\n[skillopt-sleep] Adopted {adopted} skill(s)")
     return 0
 
@@ -404,8 +471,8 @@ def cmd_run(args) -> int:
         staged = [r for r in results if isinstance(r, dict) and r.get("accepted")]
         if staged:
             print(f"\n[skillopt-sleep] {len(staged)} skill(s) staged for review.")
-            print(f"[skillopt-sleep] Review: python -m hermes_skillopt.run_nightly --list-staged")
-            print(f"[skillopt-sleep] Adopt:  python -m hermes_skillopt.run_nightly --adopt-all")
+            print("[skillopt-sleep] Review: python -m hermes_skillopt.run_nightly --list-staged")
+            print("[skillopt-sleep] Adopt:  python -m hermes_skillopt.run_nightly --adopt-all")
 
     return 0
 

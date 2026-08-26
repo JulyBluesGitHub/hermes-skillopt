@@ -12,19 +12,18 @@ Usage:
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import sqlite3
 import sys
-import argparse
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from skillopt_sleep.backend import get_backend
 from skillopt_sleep.consolidate import consolidate
-from skillopt_sleep.types import TaskRecord, EditRecord
 from skillopt_sleep.mine import assign_splits
-
+from skillopt_sleep.types import TaskRecord
 
 # ── Configuration ────────────────────────────────────────────────────────────
 
@@ -47,6 +46,17 @@ def _resolve_hermes_home() -> str:
 # ── Stage 1: Harvest Hermes Sessions ─────────────────────────────────────────
 
 @dataclass
+class PromptRecord:
+    """One user turn and the evidence used to label its outcome."""
+
+    prompt: str
+    response: str = ""
+    outcome: str = "unknown"
+    tool_errors: List[str] = field(default_factory=list)
+    skills_loaded: List[str] = field(default_factory=list)
+
+
+@dataclass
 class HermesSession:
     """A single Hermes session extracted from the state DB."""
     session_id: str
@@ -55,12 +65,60 @@ class HermesSession:
     model: str
     started_at: float
     ended_at: float
+    completed: bool
     message_count: int
     tool_call_count: int
     user_prompts: List[str] = field(default_factory=list)
     assistant_responses: List[str] = field(default_factory=list)
     tool_errors: List[str] = field(default_factory=list)
     skills_loaded: List[str] = field(default_factory=list)
+    prompt_records: List[PromptRecord] = field(default_factory=list)
+
+
+def _skill_name_from_result(content: str) -> str:
+    """Return the exact skill loaded by a successful skill_view result."""
+    try:
+        payload = json.loads(content or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return ""
+    if not isinstance(payload, dict) or payload.get("success") is False:
+        return ""
+    name = payload.get("name")
+    return name.strip() if isinstance(name, str) else ""
+
+
+def _tool_result_failed(content: str) -> bool:
+    """Classify tool output without treating ``error: null`` as failure."""
+    text = content or ""
+    try:
+        payload = json.loads(text)
+    except (TypeError, json.JSONDecodeError):
+        lowered = text.lower()
+        return (
+            "traceback (most recent call last)" in lowered
+            or lowered.lstrip().startswith("error:")
+            or '"success": false' in lowered
+        )
+
+    if not isinstance(payload, dict):
+        return False
+    if payload.get("success") is False:
+        return True
+    exit_code = payload.get("exit_code")
+    if isinstance(exit_code, int) and exit_code != 0:
+        return True
+    return bool(payload.get("error"))
+
+
+def _finish_prompt(record: PromptRecord) -> None:
+    if record.response and record.tool_errors:
+        record.outcome = "mixed"
+    elif record.response:
+        record.outcome = "success"
+    elif record.tool_errors:
+        record.outcome = "fail"
+    else:
+        record.outcome = "unknown"
 
 
 def harvest_hermes_sessions(
@@ -101,6 +159,7 @@ def harvest_hermes_sessions(
             model=row["model"] or "",
             started_at=row["started_at"],
             ended_at=row["ended_at"] or row["started_at"],
+            completed=row["ended_at"] is not None,
             message_count=row["message_count"],
             tool_call_count=row["tool_call_count"],
         )
@@ -113,61 +172,45 @@ def harvest_hermes_sessions(
             ORDER BY id
         """, (s.session_id,)).fetchall()
 
-        # Track per-prompt outcomes by correlating tool errors to preceding prompts
-        prompt_outcomes = []  # list of (prompt_text, outcome_bool)
-        current_prompt = ""
-        had_error_after = False
-        had_response_after = False
+        current: PromptRecord | None = None
+        active_skills: List[str] = []
 
         for msg in msgs:
             role = msg["role"]
             content = msg["content"] or ""
             if role == "user" and content.strip():
-                # Save previous prompt's outcome before starting new one
-                if current_prompt:
-                    if had_error_after:
-                        outcome = "fail"
-                    elif had_response_after:
-                        outcome = "success"
-                    else:
-                        outcome = "unknown"
-                    prompt_outcomes.append((current_prompt, outcome))
-                    s.user_prompts.append(current_prompt[:500])
-                current_prompt = content.strip()
-                had_error_after = False
-                had_response_after = False
+                if current is not None:
+                    _finish_prompt(current)
+                    s.prompt_records.append(current)
+                current = PromptRecord(
+                    prompt=content.strip(),
+                    skills_loaded=list(active_skills),
+                )
             elif role == "assistant" and content.strip():
-                if current_prompt:
-                    had_response_after = True
+                if current is not None:
+                    current.response = content.strip()[:1000]
                 s.assistant_responses.append(content[:1000])
             elif role == "tool" and msg["tool_name"]:
-                if any(err in (content or "").lower() for err in
-                       ["error", "traceback", "failed", "timeout", "refused"]):
-                    had_error_after = True
-                s.tool_errors.append(msg["tool_name"])
+                tool_name = msg["tool_name"]
+                if tool_name == "skill_view":
+                    skill_name = _skill_name_from_result(content)
+                    if skill_name and skill_name not in active_skills:
+                        active_skills.append(skill_name)
+                    if current is not None and skill_name and skill_name not in current.skills_loaded:
+                        current.skills_loaded.append(skill_name)
+                    if skill_name and skill_name not in s.skills_loaded:
+                        s.skills_loaded.append(skill_name)
+                if _tool_result_failed(content):
+                    error = f"{tool_name}: {content[:300]}"
+                    s.tool_errors.append(error)
+                    if current is not None:
+                        current.tool_errors.append(error)
 
-        # Don't forget the last prompt
-        if current_prompt:
-            if had_error_after:
-                outcome = "fail"
-            elif had_response_after:
-                outcome = "success"
-            else:
-                outcome = "unknown"
-            prompt_outcomes.append((current_prompt, outcome))
-            s.user_prompts.append(current_prompt[:500])
+        if current is not None:
+            _finish_prompt(current)
+            s.prompt_records.append(current)
 
-        # Store outcomes for mining
-        s._prompt_outcomes = prompt_outcomes
-
-        # Detect skills loaded from system_prompt in sessions table
-        sys_row = conn.execute(
-            "SELECT system_prompt FROM sessions WHERE id = ?", (s.session_id,)
-        ).fetchone()
-        if sys_row and sys_row["system_prompt"]:
-            import re
-            found = re.findall(r'- (\S+):', sys_row["system_prompt"] or "")
-            s.skills_loaded = list(dict.fromkeys(found))  # dedupe preserve order
+        s.user_prompts = [record.prompt[:500] for record in s.prompt_records]
 
         sessions.append(s)
 
@@ -191,36 +234,30 @@ def mine_hermes_tasks(
     task_id = 0
 
     for session in sessions:
-        # Use per-prompt outcomes from harvest
-        prompt_outcomes = getattr(session, '_prompt_outcomes', [])
-        prompts = session.user_prompts
-        responses = session.assistant_responses
+        if not session.completed:
+            continue
+        if skill_name and skill_name not in session.skills_loaded:
+            continue
 
-        for i, prompt in enumerate(prompts):
+        for record in session.prompt_records:
+            if skill_name and skill_name not in record.skills_loaded:
+                continue
             task_id += 1
-            response = responses[i] if i < len(responses) else ""
-
-            # Get outcome from the prompt_outcomes list
-            outcome = "unknown"
-            if i < len(prompt_outcomes):
-                outcome = prompt_outcomes[i][1]
-            # Check if this session loaded the target skill
-            skill_was_loaded = not skill_name or skill_name in session.skills_loaded
 
             task = TaskRecord(
                 id=f"hermes-{task_id}",
                 project=session.cwd,
-                intent=f"[{session.model}] {prompt[:200]}",
+                intent=f"[{session.model}] {record.prompt[:200]}",
                 context_excerpt=f"Session: {session.title or session.session_id[:12]}\n"
                                f"Model: {session.model}\n"
-                               f"Skills loaded: {', '.join(session.skills_loaded[:5])}",
-                attempted_solution=response[:500] if response else "",
-                outcome=outcome,
+                               f"Skills loaded: {', '.join(record.skills_loaded[:5])}",
+                attempted_solution=record.response[:500],
+                outcome=record.outcome,
                 reference_kind="none",
                 reference="",
                 judge={},
                 tags=["hermes", session.model or "unknown"] +
-                     ([skill_name] if skill_was_loaded else []),
+                     ([skill_name] if skill_name else []),
                 source_sessions=[session.session_id],
                 split="train",
                 origin="real",
@@ -363,7 +400,7 @@ def run_hermes_sleep(
 def main():
     parser = argparse.ArgumentParser(
         prog="hermes-sleep",
-        description="SkillOpt-Sleep for Hermes Agent — nightly skill evolution"
+        description="On-demand SkillOpt-Sleep for Hermes Agent"
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -424,7 +461,7 @@ def cmd_run(args) -> int:
     print(f"  Tasks mined: {report['n_tasks']} ({report['n_train']} train / {report['n_val']} val)")
 
     if report['session_sample']:
-        print(f"\n  Sampled sessions:")
+        print("\n  Sampled sessions:")
         for s in report['session_sample']:
             print(f"    • {s['title'][:60]:60s} [{s['model']}] ({s['prompts']} prompts)")
 
@@ -445,9 +482,9 @@ def cmd_run(args) -> int:
             print(f"    - [{e['target']}/{e['op']}] {e['content'][:100]}")
 
     if report['accepted'] and not dry:
-        print(f"\n  Proposed skill written. Review with:")
+        print("\n  Proposed skill written. Review with:")
         print(f"    diff <(cat hermes skills/{report['skill_name']}/SKILL.md) <(echo 'proposed')")
-        print(f"  To adopt: manually review and patch the skill file.")
+        print("  To adopt: manually review and patch the skill file.")
 
     print()
     return 0
@@ -485,7 +522,7 @@ def cmd_status(args) -> int:
         }, indent=2, ensure_ascii=False))
         return 0
 
-    print(f"\n  Hermes SkillOpt-Sleep Status")
+    print("\n  Hermes SkillOpt-Sleep Status")
     print(f"  Hermes home: {hermes_home}")
     print(f"  Skills dir: {skills_dir}")
     print(f"\n  Skills available ({len(skills)}):")

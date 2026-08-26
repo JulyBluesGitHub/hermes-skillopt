@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hermes-skillopt"
+version = "0.2.0"
+description = "On-demand SkillOpt session mining and safe skill adoption for Hermes Agent"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [{name = "JulyBluesGitHub"}]
+dependencies = ["skillopt>=0.1.0"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.11"]
+
+[project.scripts]
+hermes-skillopt = "hermes_skillopt.run_nightly:main"
+hermes-skillopt-status = "hermes_skillopt.sleep:main"
+
+[project.urls]
+Repository = "https://github.com/JulyBluesGitHub/hermes-skillopt"
+Issues = "https://github.com/JulyBluesGitHub/hermes-skillopt/issues"
+Upstream = "https://github.com/microsoft/SkillOpt"
+
+[tool.setuptools.packages.find]
+include = ["hermes_skillopt", "hermes_skillopt.*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+ignore = ["E501"]

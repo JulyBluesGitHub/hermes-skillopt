@@ -10,9 +10,9 @@ but replaces the reflect function with Hermes-specific logic.
 from __future__ import annotations
 
 import re
-from typing import Dict, List, Tuple
+from typing import List
 
-from skillopt_sleep.backend import Backend, MockBackend, keyword_soft_score
+from skillopt_sleep.backend import MockBackend
 from skillopt_sleep.types import EditRecord, ReplayResult, TaskRecord
 
 
