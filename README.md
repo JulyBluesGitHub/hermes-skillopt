@@ -176,6 +176,74 @@ answer inside the per-call timeout.
 hermes-skillopt --backend claude --skill my-skill
 ```
 
+## Judging: absolute or pairwise
+
+### `absolute` (default)
+
+The judge rates each response against the task's rubric on a 0..1 scale, and the
+gate compares the mean of those ratings before and after an edit.
+
+Measured live on `daily-ai-news-digest`, that scale is not one. Across twelve
+calls the judge emitted only `{0.0, 0.1, 0.9, 1.0}`; it gave a **four-character
+response 1.00** while a 2,564-character substantive answer scored 0.00. Against
+a deliberately harmful skill edit it separated correctly (−0.225), but against a
+deliberately *helpful* one it separated by **+0.000**. It is a coarse switch, and
+it sometimes flips the wrong way — so it can veto a disaster but cannot approve
+an improvement.
+
+### `pairwise` (recommended for real runs)
+
+```bash
+hermes-skillopt --backend hermes --judge pairwise --skill my-skill
+```
+
+Instead of rating one answer, the judge is shown the baseline answer and the
+candidate answer to the same task and asked which better satisfies the rubric.
+Ranking two responses is a much easier question than scoring one, and it is the
+standard remedy for exactly this binary collapse.
+
+This also fixes what the gate means. A baseline scores `0.5` — tied with itself,
+by definition — so `candidate > baseline` stops being a comparison of two noisy
+absolute means and becomes "the candidate wins more head-to-heads than it loses".
+
+Every comparison runs **twice with the order swapped**. Judges have strong
+position bias, and a verdict that flips when the answers are exchanged is
+recorded as a tie rather than a win. That doubles judge calls — the cheap half of
+a replay, capped at 200 tokens against an attempt's 512 — and buys a verdict
+about the answers rather than their placement.
+
+Two shortcuts keep the cost down: a candidate whose text is identical to the
+baseline is scored a tie without any call, and the gate metric is forced to
+`soft` (a pairwise score is already the comparison the gate wants; blending it
+with a threshold bit would let a candidate pass on the projection instead of on
+the answers).
+
+`--judge pairwise` requires a real backend. The mock backend derives scores from
+recorded outcomes rather than from the responses, so both sides of a comparison
+would always tie; asking for it raises rather than silently doing nothing.
+
+### Measured
+
+Four mined tasks, three skill variants (unchanged / a deliberately helpful edit /
+a deliberately harmful one), `deepseek-v4-flash`. Each variant was attempted once
+and **both judges scored the same twelve responses**, so the judge is the only
+variable.
+
+| separation vs baseline | helpful edit | harmful edit |
+|---|---|---|
+| absolute | +0.150 | −0.075 |
+| pairwise | **+0.375** | **−0.125** |
+
+Pairwise separates the helpful edit 2.5x wider, which is the number that matters:
+approving a real improvement is what the absolute judge could not do.
+
+Order-swapping earns its cost. Two of eight comparisons returned whichever answer
+was shown first, and were recorded as ties instead of results. One of those would
+otherwise have scored the *helpful* edit a loss.
+
+n = 4 tasks on one skill. Small, and a wider separation on one draw is not a
+guarantee.
+
 ### Failures are loud
 
 Real backends are wrapped so an empty or unparseable result raises instead of
@@ -198,19 +266,49 @@ python -m pytest -q
 
 CI runs lint and tests on Python 3.10, 3.11, and 3.12.
 
+### Test against the published `skillopt`, not only a local checkout
+
+`pyproject.toml` asks for `skillopt>=0.1.0`, and the two published versions do not
+call this package the same way: 0.2.0 passes `sample_id` through `replay_one` so
+repeated rollouts stop sharing one cache slot. A developer with the upstream
+repo checked out at 0.1.0 gets a green suite while an install from PyPI is
+broken, which is exactly how a fixed-signature wrapper shipped on `main`.
+
+The wrappers now forward `*args`/`**kwargs` on every seam, and there is a test
+for it. Before changing one, check both:
+
+```bash
+python -m venv /tmp/v020 && /tmp/v020/bin/pip install "skillopt==0.2.0" pytest -e .
+/tmp/v020/bin/python -m pytest -q
+```
+
 ## Project layout
 
 | Path | Purpose |
 |---|---|
 | `hermes_skillopt/sleep.py` | Session harvesting, skill attribution, task mining |
 | `hermes_skillopt/backend.py` | Hermes-specific pattern reflection |
+| `hermes_skillopt/llm_backend.py` | Real replay transport, loud-failure guard, pairwise judge |
 | `hermes_skillopt/run_nightly.py` | On-demand staging and safe adoption CLI |
 | `tests/` | Session-mining and adoption regression tests |
 
 ## Known limitations
 
 - Outcome labels are inferred from transcripts; explicit human quality labels are not yet stored by Hermes.
-- Judge scores are coarse: a subtle edit can improve a response without moving the score.
+- The default absolute judge is coarse: a subtle edit can improve a response without
+  moving the score. Use `--judge pairwise` on real runs.
+- Pairwise scores are ordinal. A win rate says the candidate is better, not by how much.
+- **The rubric rewards confidence over correctness, and no judge can fix that.**
+  Asked "can we push?", a four-character `"Yes."` — which was *wrong* — beat a
+  baseline that correctly answered "Not yet, I can't verify that from this
+  session". Both judges scored it a win, consistently and in both orders, which
+  locates the defect in `build_task_rubric` rather than in either judge:
+  it requires an answer to "directly and completely address that request" and to
+  "state its actual findings, not a description of how it would proceed", and
+  never requires it to be *right*. `"Yes."` is maximally direct, and an honest
+  "I can't verify this" reads to the judge as the hedging the rubric penalizes.
+  Until the rubric carries a grounding requirement, a confidently wrong edit can
+  still clear the gate.
 - Skill attribution is session/turn based and depends on successful `skill_view` tool results.
 - The default mock backend cannot demonstrate score lift; use `--backend hermes` to validate.
 - Staging directories created before v0.2.0 lack safety hashes and are refused; regenerate them.

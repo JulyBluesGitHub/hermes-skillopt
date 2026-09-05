@@ -397,6 +397,7 @@ def run_hermes_sleep(
     dry_run: bool = False,
     agent_path: str = "",
     model: str = "",
+    judge_mode: str = "absolute",
 ) -> Dict[str, Any]:
     """Run one sleep cycle for a Hermes skill.
 
@@ -441,6 +442,7 @@ def run_hermes_sleep(
 
     be = build_validating_backend(
         backend, hermes_home=hermes_home, agent_path=agent_path, model=model,
+        judge_mode=judge_mode,
     )
     if backend in ("mock", ""):
         print("[hermes-sleep] WARNING: the mock backend derives scores from recorded "
@@ -465,7 +467,12 @@ def run_hermes_sleep(
         result = consolidate(
             be, tasks, current_skill, "",
             edit_budget=edit_budget,
-            gate_metric="mixed",
+            # A pairwise score is already the comparison the gate wants, and it
+            # reports the same value as hard and soft, so every metric agrees
+            # today. Naming "soft" pins that: the absolute judge's hard bit is a
+            # >=0.8 threshold, and if one is ever reintroduced here the gate must
+            # still read the comparison rather than a blend with a threshold.
+            gate_metric="soft" if judge_mode == "pairwise" else "mixed",
             gate_mixed_weight=0.5,
             gate_mode="on" if use_gate else "off",
             evolve_skill=True,
@@ -491,6 +498,7 @@ def run_hermes_sleep(
         "candidate_score": round(result.candidate_score, 4),
         "accepted": result.accepted,
         "gate_action": result.gate_action,
+        "judge_mode": judge_mode,
         "edits": [
             {"target": e.target, "op": e.op, "content": e.content, "rationale": e.rationale}
             for e in result.applied_edits
