@@ -109,3 +109,32 @@ def test_list_staged_reads_utf8_reports(tmp_path, monkeypatch, capsys):
     assert "unicode-skill" in out
     assert "→" in out          # the arrow survived the round-trip
     assert "Ã" not in out and "â" not in out   # ...and was not mojibake
+
+
+def test_a_rejected_proposal_does_not_report_as_no_changes():
+    """Two opposite results printed the same line, and nothing is staged for either.
+
+    `report["edits"]` holds only what the gate kept. A proposal the gate turned
+    down left it empty, so a run where the optimizer tried and failed to beat
+    baseline was indistinguishable from one where it had nothing to suggest. The
+    first says the measurement rejected an improvement; the second says the skill
+    looks fine on these tasks.
+    """
+    from hermes_skillopt.run_nightly import summarize_outcome
+
+    nothing = summarize_outcome({"baseline_score": 0.5, "candidate_score": 0.5})
+    assert nothing == ["no changes [0.50→0.50]: the optimizer proposed nothing"]
+
+    rejected = summarize_outcome({
+        "baseline_score": 0.5, "candidate_score": 0.5, "accepted": False,
+        "rejected_edits": [{"content": "Cite the file and line for every claim."}],
+    })
+    assert "REJECTED by the gate" in rejected[0]
+    assert "nothing staged" in rejected[0]
+    assert "Cite the file and line" in rejected[1]
+
+    accepted = summarize_outcome({
+        "baseline_score": 0.5, "candidate_score": 0.75, "accepted": True,
+        "edits": [{"content": "x"}],
+    })
+    assert accepted == ["1 edit(s) [0.50→0.75] ACCEPTED"]

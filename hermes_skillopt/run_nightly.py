@@ -329,14 +329,8 @@ def run_nightly(
             results.append({"skill": skill_name, "skipped": report["message"]})
             continue
 
-        accepted = report.get("accepted", False)
-        n_edits = len(report.get("edits", []))
-        score = f"{report.get('baseline_score', 0):.2f}→{report.get('candidate_score', 0):.2f}"
-
-        if n_edits:
-            print(f"{n_edits} edit(s) [{score}] {'ACCEPTED' if accepted else 'REJECTED'}")
-        else:
-            print(f"no changes [{score}]")
+        for line in summarize_outcome(report):
+            print(line)
 
         # Stage the proposal
         if not dry_run and report.get("edits") and report.get("accepted"):
@@ -364,6 +358,31 @@ def run_nightly(
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
+
+def summarize_outcome(report: dict) -> List[str]:
+    """One run's result, in terms that separate the outcomes that look alike.
+
+    ``report["edits"]`` carries only what the gate kept, so a proposal the gate
+    turned down printed as "no changes", the same line as the optimizer having
+    nothing to say. Those are opposite results. One says the skill looks fine on
+    these tasks; the other says an improvement was attempted and did not beat
+    baseline. Nothing is staged either way, and the rejected list is the only
+    thing that tells them apart.
+    """
+    accepted = report.get("accepted", False)
+    edits = report.get("edits") or []
+    rejected = report.get("rejected_edits") or []
+    score = f"{report.get('baseline_score', 0):.2f}→{report.get('candidate_score', 0):.2f}"
+
+    if edits:
+        return [f"{len(edits)} edit(s) [{score}] {'ACCEPTED' if accepted else 'REJECTED'}"]
+    if rejected:
+        lines = [f"{len(rejected)} edit(s) proposed, all REJECTED by the gate "
+                 f"[{score}]; nothing staged"]
+        lines += [f"      - {str(e.get('content', ''))[:96]}" for e in rejected[:3]]
+        return lines
+    return [f"no changes [{score}]: the optimizer proposed nothing"]
+
 
 def main():
     enable_utf8_output()
