@@ -15,12 +15,13 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sqlite3
 import sys
 import time
 from contextlib import closing
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from skillopt_sleep.consolidate import consolidate
 from skillopt_sleep.mine import assign_splits
@@ -131,6 +132,10 @@ class PromptRecord:
     #: Every tool this turn called, in first-use order. Replay is a bare text
     #: call, so this is what says whether replaying the turn is a fair test.
     tools_used: List[str] = field(default_factory=list)
+    #: ``(tool_name, condensed result)`` for this turn, in call order. Replay
+    #: cannot run tools, so a *later* turn's context excerpt is the only route
+    #: by which what a tool found can reach the replayed model.
+    tool_results: List[Tuple[str, str]] = field(default_factory=list)
 
 
 @dataclass
@@ -150,6 +155,61 @@ class HermesSession:
     tool_errors: List[str] = field(default_factory=list)
     skills_loaded: List[str] = field(default_factory=list)
     prompt_records: List[PromptRecord] = field(default_factory=list)
+
+
+#: Per-message ceiling inside a context excerpt. Tool dumps are unbounded —
+#: a directory listing or a file read would otherwise consume the whole budget.
+_CONTEXT_MESSAGE_CHARS = 400
+
+#: Budget for one excerpt, spent newest-turn-first because the turn immediately
+#: before the task is the one whose result the task refers to. A single turn
+#: larger than this is still rendered whole — trimming it would cost the reply
+#: at its end, and dropping it would leave the excerpt empty.
+_CONTEXT_CHARS = 2000
+
+#: Tool results kept per rendered turn, counting back from the last. A turn can
+#: call a tool twenty times; the calls that produced the reply are the late ones.
+_CONTEXT_TOOLS_PER_TURN = 4
+
+#: Redacted before any excerpt leaves this process. Filling the excerpt means
+#: shell output and file contents now reach a model provider, which they did
+#: not when it carried only a session title.
+_SECRET_PATTERNS = (
+    # NAME=value / "NAME": "value", where NAME itself says it is a credential.
+    # Both quotes are optional because a tool result is usually JSON, and there
+    # the value also ends at a literal "\n" escape rather than at whitespace.
+    (re.compile(
+        r"(?i)\b([A-Za-z0-9_]*(?:API_?KEY|_KEY|SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIAL)"
+        r"[A-Za-z0-9_]*)\b([\"']?\s*[=:]\s*[\"']?)[^\s,;\\]+"), r"\1\2<redacted>"),
+    # Provider-issued keys, which appear bare in output with nothing naming them
+    (re.compile(r"\b(?:sk|pk|ghp|gho|ghs|ghu|ghr|xox[abprs])[-_][A-Za-z0-9_-]{8,}"),
+     "<redacted>"),
+    (re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{8,}"), "Bearer <redacted>"),
+)
+
+
+def redact_secrets(text: str) -> str:
+    """Blank out credential-shaped substrings, keeping the name that labelled them.
+
+    Applied once, to the assembled excerpt, rather than per message: the excerpt
+    is the boundary where harvested history becomes an outbound prompt, and it
+    is short enough that scanning it is free.
+    """
+    for pattern, replacement in _SECRET_PATTERNS:
+        text = pattern.sub(replacement, text)
+    return text
+
+
+def _condense(text: str, limit: int = _CONTEXT_MESSAGE_CHARS) -> str:
+    """Collapse ``text`` to one line of at most ``limit`` characters.
+
+    Tool results are mostly indentation and blank lines; kept verbatim they buy
+    a fraction of the content per character of budget. The oversized slice taken
+    first bounds the work on a megabyte-long result while still leaving enough
+    material to fill ``limit`` once the whitespace is gone.
+    """
+    flat = " ".join((text or "")[: limit * 8].split())
+    return flat[:limit] + ("..." if len(flat) > limit else "")
 
 
 def _skill_name_from_result(content: str) -> str:
@@ -266,8 +326,10 @@ def _build_session(conn: sqlite3.Connection, row: sqlite3.Row) -> HermesSession:
             s.assistant_responses.append(content[:1000])
         elif role == "tool" and msg["tool_name"]:
             tool_name = msg["tool_name"]
-            if current is not None and tool_name not in current.tools_used:
-                current.tools_used.append(tool_name)
+            if current is not None:
+                if tool_name not in current.tools_used:
+                    current.tools_used.append(tool_name)
+                current.tool_results.append((tool_name, _condense(content)))
             if tool_name == "skill_view":
                 skill_name = _skill_name_from_result(content)
                 if skill_name and skill_name not in active_skills:
@@ -296,6 +358,58 @@ def _build_session(conn: sqlite3.Connection, row: sqlite3.Row) -> HermesSession:
 _INTENT_CHARS = 300
 #: Rubrics are read by a judge, so they can afford the whole request.
 _RUBRIC_CHARS = 800
+
+
+def _render_turn(record: "PromptRecord") -> str:
+    """One earlier turn, as the request, what its tools returned, and the reply.
+
+    Results are condensed again here even though harvesting already condensed
+    them: there it bounds what a 200-session sweep holds in memory, here it is
+    what guarantees the rendered shape, for a record however it was built.
+    """
+    lines = ["[user] " + _condense(record.prompt)]
+    kept = record.tool_results[-_CONTEXT_TOOLS_PER_TURN:]
+    lines += ["[tool:" + name + "] " + _condense(result) for name, result in kept]
+    if record.response:
+        lines.append("[assistant] " + _condense(record.response))
+    return "\n".join(lines)
+
+
+def build_context_excerpt(session: "HermesSession", upto: int) -> str:
+    """Render the conversation preceding turn ``upto`` for a toolless replay.
+
+    Replay is a single-shot text call: the model is handed the skill and one
+    intent, and nothing else. Every turn this tool can mine sits after some
+    earlier turn that ran a tool (measured: 0% of turns for the sampled skill
+    have a tool-free prefix), so the facts the mined request refers to were
+    established by tools replay cannot run. This field is the only channel that
+    can carry them, and it previously carried the session title and the model
+    name instead — so the replayed model was asked about a repository it had
+    never been shown, correctly said so, and lost to one that guessed.
+
+    Budget is spent newest-first and rendered oldest-first: when a conversation
+    does not fit, the turns immediately before the task are the ones its request
+    actually refers back to. Turn ``upto`` itself is excluded — its own answer is
+    what replay is supposed to produce.
+    """
+    header = ["Session: " + (session.title or session.session_id[:12])]
+    skills = session.prompt_records[upto].skills_loaded if upto < len(session.prompt_records) else []
+    if skills:
+        header.append("Skills loaded: " + ", ".join(skills[:5]))
+
+    blocks: List[str] = []
+    spent = 0
+    for record in reversed(session.prompt_records[:upto]):
+        block = _render_turn(record)
+        if blocks and spent + len(block) > _CONTEXT_CHARS:
+            break
+        blocks.append(block)
+        spent += len(block)
+    if not blocks:
+        return "\n".join(header)
+
+    body = "\n\n".join(reversed(blocks))
+    return redact_secrets("\n".join(header) + "\n\nEarlier in this conversation:\n\n" + body)
 
 
 def build_task_rubric(record: "PromptRecord") -> str:
@@ -370,6 +484,12 @@ def mine_hermes_tasks(
     in replay and are actively harmful in production, where the agent does have
     tools and the skill may have a fail-closed rule saying not to guess.
 
+    That filter is necessary and not sufficient: a turn can call no tool itself
+    and still depend entirely on what an earlier one found. Each task therefore
+    carries the conversation that preceded it — see :func:`build_context_excerpt`
+    — so replay is asked the question the user actually asked, with the same
+    facts in front of it.
+
     Pass ``require_replayable=False`` to mine them anyway, and ``skipped`` to
     receive a tool-name histogram of what was dropped.
     """
@@ -382,7 +502,7 @@ def mine_hermes_tasks(
         if skill_name and skill_name not in session.skills_loaded:
             continue
 
-        for record in session.prompt_records:
+        for index, record in enumerate(session.prompt_records):
             if skill_name and skill_name not in record.skills_loaded:
                 continue
             needed = turn_needs_tools(record)
@@ -397,9 +517,7 @@ def mine_hermes_tasks(
                 id=f"hermes-{task_id}",
                 project=session.cwd,
                 intent=record.prompt[:_INTENT_CHARS],
-                context_excerpt=f"Session: {session.title or session.session_id[:12]}\n"
-                               f"Model: {session.model}\n"
-                               f"Skills loaded: {', '.join(record.skills_loaded[:5])}",
+                context_excerpt=build_context_excerpt(session, index),
                 attempted_solution=record.response[:500],
                 outcome=record.outcome,
                 reference_kind="rubric",

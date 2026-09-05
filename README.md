@@ -153,10 +153,10 @@ the run says so.
 
 ### The filter is necessary and not sufficient
 
-Tools are one of two things replay does not have. The other is the conversation.
+Tools are one of two things replay does not have. The other was the conversation.
 A turn that called no tool itself can still depend on files read, or answers
-given, three turns earlier — and replay gets a skill, an intent and a short
-context excerpt, never the history.
+given, three turns earlier — and replay gets a skill, an intent and a context
+excerpt, nothing more.
 
 `python experiments/replayability_tiers.py` counts what survives each definition,
 over 200 real sessions:
@@ -168,17 +168,54 @@ over 200 real sessions:
 | 3. ...and it is the session's first turn | 0 (0.0%) | 33 (1.4%) |
 
 Zero. Every turn attributed to that skill sits after some turn in its session
-used a tool, so every mined task inherits context replay cannot reproduce.
+used a tool, so every mined task inherits context replay cannot reproduce — which
+is what "What the excerpt carries", below, exists to supply. Tier 1 is still what
+the miner enforces; tiers 2 and 3 measure how much context it has to hand over.
 
-This is visible in the replays. Asked to explain a repo, the model answered
+This was visible in the replays. Asked to explain a repo, the model answered
 *"no repository, code, or file contents were actually provided in this session"* —
 correctly, because none were — and lost to a baseline that answered anyway.
 The same shape as the tool problem, one level up.
 
-So tier 1 removes the confirmed pathology and is worth having, but the binding
-constraint is now **context, not tools**. Fixing it means filling
-`context_excerpt` with the preceding turns and their tool results, rather than
-the session title and model name it carries today.
+So tier 1 removes the confirmed pathology and is worth having, but it left the
+binding constraint on **context, not tools**.
+
+### What the excerpt carries
+
+`context_excerpt` is pasted into the attempt prompt directly beneath the intent.
+It used to hold the session title, the model name, and a list of skill names —
+which is why tier 2 measured zero: nothing in it could tell a replay what an
+earlier turn had found. It now carries the conversation itself:
+
+```
+Session: Daily AI news digest #3
+Skills loaded: daily-ai-news-digest, github, skillopt
+
+Earlier in this conversation:
+
+[user] can we push?
+[tool:terminal] {"output": "HEAD -> fix/safe-session-mining ... ", "exit_code": 0}
+[assistant] Already pushed and verified. Local HEAD matches the remote branch...
+```
+
+Across the same 200 sessions, 744 of 777 mined tasks (95.8%) now carry real
+preceding turns; the remaining 4.2% are the first turn of their session, which
+had none. Excerpts run to a median of 1.8k characters and a p95 of 2.3k.
+
+The budget is spent newest-turn-first and rendered oldest-first — when a
+conversation does not fit, the turns nearest the task are the ones its request
+refers back to. The replayed turn is never in its own excerpt: its answer is
+what replay is supposed to produce.
+
+**Tool output is redacted before it leaves the process.** Filling the excerpt
+means shell output and file contents now reach a model provider, which they did
+not when it held a session title. Credential-shaped substrings are blanked while
+the name that labelled them is kept, so the model still knows a key was there.
+Over real history this fired 64 times — mostly `read_file` on a config with
+`api_key:` in it — and left no credential-shaped string behind.
+
+This does not make an unreplayable turn replayable, and the tool filter still
+runs: a turn that needed to *run* something is still dropped.
 
 ## Outcome labels
 
@@ -374,10 +411,13 @@ python -m venv /tmp/v020 && /tmp/v020/bin/pip install "skillopt==0.2.0" pytest -
 - Skill attribution is session/turn based and depends on successful `skill_view` tool results.
 - Roughly half of mined turns are dropped as unreplayable. Optimizing a skill whose
   work is mostly tool-driven means optimizing the minority of it that is conversation.
-- **Replay has no conversation history, and every mined task for the measured skill
-  needs some.** The tool filter does not fix this; see "The filter is necessary and
-  not sufficient". Until `context_excerpt` carries the real preceding turns, a
-  replay can answer honestly and still lose to one that guesses.
+- Replay still has no *tools*. `context_excerpt` now carries the preceding turns
+  and what their tools returned, so a mined task no longer refers to facts the
+  replay was never shown — but it is a transcript, not a working directory. A
+  turn that needed to run something is dropped, not replayed from context.
+- Tool output in an excerpt is redacted by pattern, not by parsing. It catches
+  credential-shaped substrings; it is not a guarantee that nothing sensitive
+  reaches the provider.
 - The default mock backend cannot demonstrate score lift; use `--backend hermes` to validate.
 - Staging directories created before v0.2.0 lack safety hashes and are refused; regenerate them.
 
