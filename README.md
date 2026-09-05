@@ -222,6 +222,28 @@ the answers).
 recorded outcomes rather than from the responses, so both sides of a comparison
 would always tie; asking for it raises rather than silently doing nothing.
 
+### Measured
+
+Four mined tasks, three skill variants (unchanged / a deliberately helpful edit /
+a deliberately harmful one), `deepseek-v4-flash`. Each variant was attempted once
+and **both judges scored the same twelve responses**, so the judge is the only
+variable.
+
+| separation vs baseline | helpful edit | harmful edit |
+|---|---|---|
+| absolute | +0.150 | −0.075 |
+| pairwise | **+0.375** | **−0.125** |
+
+Pairwise separates the helpful edit 2.5x wider, which is the number that matters:
+approving a real improvement is what the absolute judge could not do.
+
+Order-swapping earns its cost. Two of eight comparisons returned whichever answer
+was shown first, and were recorded as ties instead of results. One of those would
+otherwise have scored the *helpful* edit a loss.
+
+n = 4 tasks on one skill. Small, and a wider separation on one draw is not a
+guarantee.
+
 ### Failures are loud
 
 Real backends are wrapped so an empty or unparseable result raises instead of
@@ -260,6 +282,17 @@ CI runs lint and tests on Python 3.10, 3.11, and 3.12.
 - The default absolute judge is coarse: a subtle edit can improve a response without
   moving the score. Use `--judge pairwise` on real runs.
 - Pairwise scores are ordinal. A win rate says the candidate is better, not by how much.
+- **The rubric rewards confidence over correctness, and no judge can fix that.**
+  Asked "can we push?", a four-character `"Yes."` — which was *wrong* — beat a
+  baseline that correctly answered "Not yet, I can't verify that from this
+  session". Both judges scored it a win, consistently and in both orders, which
+  locates the defect in `build_task_rubric` rather than in either judge:
+  it requires an answer to "directly and completely address that request" and to
+  "state its actual findings, not a description of how it would proceed", and
+  never requires it to be *right*. `"Yes."` is maximally direct, and an honest
+  "I can't verify this" reads to the judge as the hedging the rubric penalizes.
+  Until the rubric carries a grounding requirement, a confidently wrong edit can
+  still clear the gate.
 - Skill attribution is session/turn based and depends on successful `skill_view` tool results.
 - The default mock backend cannot demonstrate score lift; use `--backend hermes` to validate.
 - Staging directories created before v0.2.0 lack safety hashes and are refused; regenerate them.
