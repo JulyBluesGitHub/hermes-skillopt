@@ -282,6 +282,8 @@ def run_nightly(
     dry_run: bool = False,
     skills_dir: str = "",
     staging_root: str = "",
+    agent_path: str = "",
+    model: str = "",
 ) -> List[dict]:
     """Run sleep cycle for specified skills (or auto-detect recently used ones)."""
     from hermes_skillopt.sleep import run_hermes_sleep
@@ -310,6 +312,8 @@ def run_nightly(
                 edit_budget=edit_budget,
                 backend=backend,
                 dry_run=dry_run,
+                agent_path=agent_path,
+                model=model,
             )
         except Exception as e:
             print(f"ERROR: {e}")
@@ -370,7 +374,12 @@ def main():
     parser.add_argument("--max-sessions", type=int, default=15)
     parser.add_argument("--max-tasks", type=int, default=30)
     parser.add_argument("--edit-budget", type=int, default=4)
-    parser.add_argument("--backend", default="mock", choices=["mock", "claude", "codex"])
+    parser.add_argument("--backend", default="mock", choices=["mock", "hermes", "claude", "codex"],
+                        help="mock = offline heuristics (cannot validate); hermes = replay via "
+                             "Hermes's configured providers")
+    parser.add_argument("--model", default="", help="Override the replay model")
+    parser.add_argument("--hermes-agent-path", default="",
+                        help="hermes-agent checkout providing agent.auxiliary_client")
     parser.add_argument("--hermes-home", default="")
     parser.add_argument("--skills-dir", default="",
                         help="Skills directory (default: <hermes-home>/skills)")
@@ -472,6 +481,8 @@ def cmd_run(args) -> int:
         max_tasks=args.max_tasks,
         edit_budget=args.edit_budget,
         backend=args.backend,
+        agent_path=args.hermes_agent_path,
+        model=args.model,
         dry_run=args.dry_run,
     )
 
