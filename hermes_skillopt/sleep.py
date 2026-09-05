@@ -211,6 +211,18 @@ def redact_secrets(text: str) -> str:
     return text
 
 
+#: Provider tool-call syntax, as Hermes stored it in the message log — e.g.
+#: ``<｜｜DSML｜｜invoke name="read_file">``. Ten captured results carry it.
+#:
+#: This is hygiene, not the fix for a measured failure. A replay did emit a
+#: `read_file` call instead of an answer — for a file already quoted in its own
+#: excerpt, scoring 0.00 — but none of the four excerpts in that run contained
+#: this markup, so the model produced the convention unprompted. What invited it
+#: was a transcript that simply stopped; see the delimiters in
+#: :func:`build_context_excerpt`. Stripping only keeps us from ever seeding it.
+_TOOL_CALL_MARKUP = re.compile(r"<[^<>]{0,120}DSML[^<>]{0,120}>")
+
+
 def _condense(text: str, limit: int = _CONTEXT_MESSAGE_CHARS) -> str:
     """Collapse ``text`` to one line of at most ``limit`` characters.
 
@@ -218,8 +230,12 @@ def _condense(text: str, limit: int = _CONTEXT_MESSAGE_CHARS) -> str:
     a fraction of the content per character of budget. The oversized slice taken
     first bounds the work on a megabyte-long result while still leaving enough
     material to fill ``limit`` once the whitespace is gone.
+
+    Tool-call markup goes first, before the slice is measured, so that stripping
+    it cannot be what pushes real content past ``limit``.
     """
-    flat = " ".join((text or "")[: limit * 8].split())
+    stripped = _TOOL_CALL_MARKUP.sub(" ", (text or "")[: limit * 8])
+    flat = " ".join(stripped.split())
     return flat[:limit] + ("..." if len(flat) > limit else "")
 
 
@@ -419,8 +435,19 @@ def build_context_excerpt(session: "HermesSession", upto: int) -> str:
     if not blocks:
         return "\n".join(header)
 
+    # The record is delimited at both ends. Without a closing marker the excerpt
+    # simply stops, and the likeliest continuation of a transcript is the next
+    # entry in it — which is how a replay came to emit a tool call instead of an
+    # answer. The wording stays neutral about what to do with the record: telling
+    # the model to answer regardless of what it can verify is the exact harness
+    # workaround the replayability filter exists to stop rewarding.
     body = "\n\n".join(reversed(blocks))
-    return redact_secrets("\n".join(header) + "\n\nEarlier in this conversation:\n\n" + body)
+    return redact_secrets(
+        "\n".join(header)
+        + "\n\n--- record of earlier turns in this conversation ---\n\n"
+        + body
+        + "\n\n--- end of record ---"
+    )
 
 
 def build_task_rubric(record: "PromptRecord") -> str:

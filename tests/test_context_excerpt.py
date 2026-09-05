@@ -59,7 +59,7 @@ def test_the_first_turn_has_no_conversation_to_report():
 
     excerpt = build_context_excerpt(session, 0)
 
-    assert "Earlier in this conversation" not in excerpt
+    assert "record of earlier turns" not in excerpt
     assert excerpt.startswith("Session: Daily digest")
 
 
@@ -171,6 +171,38 @@ def test_a_long_tool_dump_is_condensed_to_one_line():
     excerpt = build_context_excerpt(session, 1)
 
     assert "[tool:terminal] a b c" in excerpt
+
+
+# ── a record, not a transcript to continue ───────────────────────────────────
+
+def test_the_record_is_delimited_at_both_ends():
+    """An excerpt that just stops invites the model to write the next entry.
+
+    Measured: with no closing marker, one replay in twelve answered with a
+    `read_file` tool call — for a file already quoted in its own excerpt.
+    """
+    session = _session(_turn("earlier", "answered"), _turn("the mined request"))
+
+    excerpt = build_context_excerpt(session, 1)
+
+    assert "--- record of earlier turns in this conversation ---" in excerpt
+    assert excerpt.endswith("--- end of record ---")
+
+
+def test_provider_tool_call_markup_never_reaches_the_prompt():
+    """Hermes stored DeepSeek's calling convention verbatim in the message log."""
+    call = ('<｜｜DSML｜｜tool_calls><｜｜DSML｜｜invoke '
+            'name="read_file">notes.md</｜｜DSML｜｜invoke>')
+    session = _session(
+        _turn("read it", "done", tools=[("read_file", call + " contents follow")]),
+        _turn("and now?"),
+    )
+
+    excerpt = build_context_excerpt(session, 1)
+
+    assert "DSML" not in excerpt
+    assert "tool_calls" not in excerpt
+    assert "contents follow" in excerpt, "stripping markup must keep the result"
 
 
 # ── what the excerpt must never leak ─────────────────────────────────────────
