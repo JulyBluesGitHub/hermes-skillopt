@@ -129,11 +129,13 @@ here cannot mutate Hermes's `state.db`.
 
 Replay is a single-shot text call with no tools. A turn that shelled out to
 answer "can we push?" cannot be replayed fairly. The model cannot run
-`git status`, says it cannot verify, and the rubric marks that down as
-"describing how it would proceed". The optimizer's only way out is a rule like
-*"do not decline, answer from what you know"*, which scores well in replay and is
-harmful in production, where the agent does have tools and the skill may carry a
-fail-closed rule against guessing.
+`git status` and can only report that it cannot verify. The rubric used to mark
+that down as describing how it would proceed, and the optimizer's way out was a
+rule like *"do not decline, answer from what you know"*, which scores well in
+replay and is harmful in production, where the agent does have tools and the
+skill may carry a fail-closed rule against guessing. A reported limit now counts
+as a finding, which removes the pressure toward that rule but not the reason to
+drop the turn: replaying it still asks a question the replay cannot answer.
 
 So the miner drops turns that used tools replay cannot supply. `skill_view` is
 the one exception, because replay puts the skill straight into the prompt and
@@ -344,6 +346,11 @@ deliberately helpful one it separated by +0.000. It is a coarse switch that
 sometimes flips the wrong way. It can veto a disaster and cannot approve an
 improvement.
 
+The grounding requirement in the rubric spread that scale out to seven distinct
+values with no ceiling. It also made the judge stricter with the helpful edit
+rather than kinder, scoring it -0.350 below baseline. See "What the grounding
+requirement changed".
+
 ### `pairwise` (recommended for real runs)
 
 ```bash
@@ -417,6 +424,48 @@ orders under comparison. See "What filling it measured" for the four runs that
 got there, and for the single response that made one of them look like a
 regression.
 
+### What the grounding requirement changed
+
+`experiments/judge_grounding.py` judges four fixed pairs in both orders, under the
+requirements as they were and as they are. Sixteen comparisons, ~17k tokens.
+
+| pair | before | after |
+|---|---|---|
+| `"Yes."` vs "Not yet, I can't verify that from this session" | **guess wins both orders** | limit wins both |
+| the same limit, elaborated | limit wins | limit wins |
+| a plan offered in place of the work | answer wins | answer wins |
+| an unnecessary limit vs. the answer the request contains | answer wins | answer wins |
+
+The pathology reproduces only against the *terse* honest answer. Elaborate the
+same refusal and it won before the change too, so what the confident guess beat
+was brevity plus a rubric that never asked for support.
+
+The last two pairs are the over-correction guard. Teaching a judge to respect "I
+can't verify that" is progress only while an answer still beats a plan, and while
+an unnecessary limit still loses to the answer the request already contains. Both
+hold after the change.
+
+n = 1 per cell. This is a regression probe for one known defect, not a measure of
+judge quality.
+
+**The full comparison run is unmoved.** Re-scoring the same twelve stored answers
+leaves pairwise exactly where it was. Helpful +0.375, harmful -0.500, ranking
+good > baseline > bad. Only the judge changed between the runs; the responses are
+byte-identical, served from the attempt cache. The grounding requirement costs
+the comparison judge nothing.
+
+**The absolute judge moves, and not in its favour.** Its ceiling is gone:
+baselines that all scored 1.00 now spread 0.20 to 1.00, and the scale emits seven
+distinct values where it used to emit four. But it scores the helpful edit 0.275
+against a 0.625 baseline, which is -0.350 where it used to be +0.000. Its own
+reasons say why: "grounds no claims in actual evidence", "makes numerous claims".
+The helpful edit's answers are the longest in the run, a median 2,842 characters
+against the baseline's 1,611. A longer answer makes more claims, and a
+requirement to support each of them hands a judge that never sees the record more
+to mark down. No gate decision changes, since absolute rejected the helpful edit
+before this too, for want of headroom rather than for cause. But the coarse judge
+is now a harsh one, and the case for `--judge pairwise` is stronger than it was.
+
 ### Failures are loud
 
 A wrapper around every real backend raises on an empty or unparseable result
@@ -463,6 +512,7 @@ python -m venv /tmp/v020 && /tmp/v020/bin/pip install "skillopt==0.2.0" pytest -
 | `hermes_skillopt/llm_backend.py` | Real replay transport, loud-failure guard, pairwise judge |
 | `hermes_skillopt/run_nightly.py` | On-demand staging and safe adoption CLI |
 | `tests/` | Session-mining and adoption regression tests |
+| `experiments/` | Live judge measurements: separation, replayability tiers, grounding |
 
 ## Known limitations
 
@@ -470,21 +520,22 @@ python -m venv /tmp/v020 && /tmp/v020/bin/pip install "skillopt==0.2.0" pytest -
 - The default absolute judge is coarse. A subtle edit can improve a response
   without moving the score, so use `--judge pairwise` on real runs.
 - Pairwise scores are ordinal. A win rate says the candidate is better, not by how much.
-- **The rubric rewards confidence over correctness, and no judge can fix that.**
+- **The rubric now asks for grounding; the judge still cannot check facts.**
   Asked "can we push?", a four-character `"Yes."`, which was wrong, beat a
   baseline that correctly answered "Not yet, I can't verify that from this
-  session". Both judges scored it a win, consistently and in both orders, which
-  locates the defect in `build_task_rubric` rather than in either judge. The
-  rubric requires an answer to "directly and completely address that request" and
-  to "state its actual findings, not a description of how it would proceed", and
-  never requires it to be right. `"Yes."` is maximally direct, and an honest "I
-  can't verify this" reads to the judge as the hedging the rubric penalizes.
-  Until the rubric carries a grounding requirement, a confidently wrong edit can
-  still clear the *absolute* judge, which rated a 62-character answer 1.00 on a
-  task the pairwise judge scored a loss in both orders. Filling `context_excerpt`
-  and delimiting it removed the version of this that came from missing context,
-  and comparison contains what is left. The rubric text itself is unfixed, so use
-  `--judge pairwise`. See "What filling it measured".
+  session". Both judges scored it a win in both orders, which located the defect
+  in `build_task_rubric` rather than in either judge. Nothing there required an
+  answer to be *supported*. `"Yes."` is maximally direct, and naming a limit of
+  the evidence read as the hedging the findings requirement penalizes. Two
+  requirements now say so outright, the findings requirement names what it was
+  aimed at (a plan offered in place of the work), and the comparison instructions
+  no longer count every declining answer as a deferral. On the probe that
+  reproduces the case the honest answer goes from losing both orders to winning
+  both. What this does not buy is fact checking. The judge sees the request and
+  two answers, never the record, so it can prefer an answer that rests on
+  something over one that rests on nothing, and cannot tell you which is right.
+  Comparison is still the stronger guard, so use `--judge pairwise`. See "What
+  the grounding requirement changed".
 - Skill attribution is session/turn based and depends on successful `skill_view` tool results.
 - The miner drops roughly half of all turns as unreplayable. Optimizing a skill
   whose work is mostly tool-driven means optimizing the minority of it that is
