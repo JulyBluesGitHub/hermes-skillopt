@@ -224,8 +224,8 @@ class StrictBackend:
     def _guard(self, original):
         backend_name = self.name
 
-        def guarded(prompt: str, *, max_tokens: int = 1024) -> str:
-            out = original(prompt, max_tokens=max_tokens)
+        def guarded(prompt: str, *args: Any, **kwargs: Any) -> str:
+            out = original(prompt, *args, **kwargs)
             if not (out or "").strip():
                 raise BackendCallError(
                     f"Backend {backend_name!r} returned an empty response. "
@@ -238,9 +238,17 @@ class StrictBackend:
         return guarded
 
     # -- delegated operations ------------------------------------------------
+    #
+    # Every override forwards *args/**kwargs untouched. A wrapper that restates
+    # upstream's parameter list silently breaks the moment upstream adds one:
+    # skillopt 0.2.0 began calling ``attempt(task, skill, memory, sample_id=N)``
+    # to keep repeated rollouts out of one cache slot, and a fixed three-argument
+    # ``attempt`` here raised TypeError on every replay against it. Forwarding
+    # costs nothing and is the only version-agnostic shape for a pass-through.
 
-    def attempt(self, task: TaskRecord, skill: str, memory: str) -> str:
-        response = self._inner.attempt(task, skill, memory)
+    def attempt(self, task: TaskRecord, skill: str, memory: str,
+                *args: Any, **kwargs: Any) -> str:
+        response = self._inner.attempt(task, skill, memory, *args, **kwargs)
         if not (response or "").strip():
             raise BackendCallError(
                 f"Backend {self.name!r} produced no response for task {task.id}; "
@@ -248,8 +256,9 @@ class StrictBackend:
             )
         return response
 
-    def judge(self, task: TaskRecord, response: str) -> Tuple[float, float, str]:
-        hard, soft, reason = self._inner.judge(task, response)
+    def judge(self, task: TaskRecord, response: str,
+              *args: Any, **kwargs: Any) -> Tuple[float, float, str]:
+        hard, soft, reason = self._inner.judge(task, response, *args, **kwargs)
         if reason == "judge-parse-failed":
             raise BackendCallError(
                 f"Judge returned unparseable output for task {task.id}. Scoring it "
@@ -351,12 +360,13 @@ class PairwiseJudge:
 
     # -- judging -------------------------------------------------------------
 
-    def judge(self, task: TaskRecord, response: str) -> Tuple[float, float, str]:
+    def judge(self, task: TaskRecord, response: str,
+              *args: Any, **kwargs: Any) -> Tuple[float, float, str]:
         rubric = (task.reference or task.intent or "").strip()
 
         if task.id not in self._baseline:
             self._baseline[task.id] = response
-            return (_TIE, _TIE, self._baseline_rationale(task, response))
+            return (_TIE, _TIE, self._baseline_rationale(task, response, *args, **kwargs))
 
         baseline = self._baseline[task.id]
         # Identical text cannot beat itself, and an edit that changed nothing is
@@ -382,7 +392,8 @@ class PairwiseJudge:
             return (_TIE, _TIE, f"tie both orders: {first[1]}")
         return (_TIE, _TIE, f"order-dependent ({first[0]} then {second[0]}); scored a tie")
 
-    def _baseline_rationale(self, task: TaskRecord, response: str) -> str:
+    def _baseline_rationale(self, task: TaskRecord, response: str,
+                            *args: Any, **kwargs: Any) -> str:
         """One absolute judgement of the baseline, kept only as a why-wrong note.
 
         ``reflect`` shows the optimizer each failing task's ``fail_reason``, and
@@ -394,7 +405,7 @@ class PairwiseJudge:
         if not self.diagnose_baseline:
             return "baseline (no comparison yet)"
         try:
-            _hard, _soft, reason = self._inner.judge(task, response)
+            _hard, _soft, reason = self._inner.judge(task, response, *args, **kwargs)
         except Exception as exc:  # a diagnostic must never fail the run
             logger.debug("Baseline diagnosis failed for %s: %s", task.id, exc)
             return "baseline (no comparison yet)"

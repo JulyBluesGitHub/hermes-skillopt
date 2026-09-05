@@ -45,10 +45,10 @@ class ScriptedBackend:
         self.edits = list(edits)
         self.comparisons = 0
 
-    def attempt(self, task, skill, memory):
+    def attempt(self, task, skill, memory, **kwargs):
         return GOOD if RULE in (skill or "") else POOR
 
-    def judge(self, task, response):
+    def judge(self, task, response, **kwargs):
         # The absolute judge, used only for the baseline's why-wrong note.
         return (0.0, 0.1, "declined instead of answering")
 

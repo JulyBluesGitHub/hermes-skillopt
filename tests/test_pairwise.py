@@ -52,7 +52,7 @@ class FakeBackend:
         self.absolute_calls += 1
         return self.absolute
 
-    def attempt(self, task, skill, memory):
+    def attempt(self, task, skill, memory, **kwargs):
         return "delegated"
 
     def tokens_used(self):
@@ -235,3 +235,38 @@ def test_responses_containing_percent_and_braces_do_not_break_the_prompt():
     assert hard == 1.0
     assert "revenue rose 40% -> {'q': 3}" in fake.prompts[0]
     assert "100% precisely" in fake.prompts[0]
+
+
+class EvolvedBackend(FakeBackend):
+    """Upstream as it exists from skillopt 0.2.0 on: extra arguments on the seams."""
+
+    def attempt(self, task, skill, memory, *, sample_id=0):
+        return f"delegated sample={sample_id}"
+
+    def judge(self, task, response, *, sample_id=0):
+        self.absolute_calls += 1
+        return self.absolute
+
+    def _call(self, prompt, *, max_tokens=1024, sample_id=0):
+        return super()._call(prompt, max_tokens=max_tokens)
+
+
+def test_wrappers_forward_arguments_they_do_not_know_about():
+    """A wrapper that restates upstream's parameter list breaks when upstream adds one.
+
+    skillopt 0.2.0 began passing ``sample_id`` through replay so repeated rollouts
+    stop collapsing into one cache slot. StrictBackend's fixed three-argument
+    ``attempt`` raised TypeError on every replay against it — and this repo pins
+    only ``skillopt>=0.1.0``, so an install from PyPI got the broken pairing while
+    a local 0.1.0 checkout hid it.
+    """
+    from hermes_skillopt.llm_backend import StrictBackend
+
+    strict = StrictBackend(EvolvedBackend(winners=["B", "A"]))
+    assert strict.attempt(_task(), "skill", "mem", sample_id=3) == "delegated sample=3"
+    assert strict.judge(_task(), "resp", sample_id=3)[0] == 1.0
+
+    judge = PairwiseJudge(strict)
+    task = _task()
+    assert judge.judge(task, "baseline", sample_id=1)[:2] == (0.5, 0.5)
+    assert judge.judge(task, "candidate", sample_id=1)[:2] == (1.0, 1.0)

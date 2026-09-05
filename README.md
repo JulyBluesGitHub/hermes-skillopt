@@ -266,6 +266,22 @@ python -m pytest -q
 
 CI runs lint and tests on Python 3.10, 3.11, and 3.12.
 
+### Test against the published `skillopt`, not only a local checkout
+
+`pyproject.toml` asks for `skillopt>=0.1.0`, and the two published versions do not
+call this package the same way: 0.2.0 passes `sample_id` through `replay_one` so
+repeated rollouts stop sharing one cache slot. A developer with the upstream
+repo checked out at 0.1.0 gets a green suite while an install from PyPI is
+broken, which is exactly how a fixed-signature wrapper shipped on `main`.
+
+The wrappers now forward `*args`/`**kwargs` on every seam, and there is a test
+for it. Before changing one, check both:
+
+```bash
+python -m venv /tmp/v020 && /tmp/v020/bin/pip install "skillopt==0.2.0" pytest -e .
+/tmp/v020/bin/python -m pytest -q
+```
+
 ## Project layout
 
 | Path | Purpose |
