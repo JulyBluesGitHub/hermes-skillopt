@@ -18,41 +18,39 @@ import json
 import os
 import sys
 import time
+from contextlib import closing
 from typing import Dict, List, Optional
 
-# Add repo root
-_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-sys.path.insert(0, _REPO_ROOT)
+from hermes_skillopt.sleep import _resolve_hermes_home, connect_readonly, enable_utf8_output
 
-HERMES_HOME = os.path.expanduser("~/AppData/Local/hermes")
+# Resolved from HERMES_HOME / the platform default rather than a frozen Windows
+# path, so the staging root follows the same install the sessions come from.
+HERMES_HOME = _resolve_hermes_home()
 STAGING_ROOT = os.path.join(HERMES_HOME, "skillopt-staging")
 
 
 def recently_used_skills(hermes_home: str = "", lookback_hours: int = 72, max_skills: int = 20) -> List[str]:
     """Find skills actually loaded through successful ``skill_view`` calls."""
-    import sqlite3
-
-    db_path = os.path.join(hermes_home or HERMES_HOME, "state.db")
+    db_path = os.path.join(hermes_home or _resolve_hermes_home(), "state.db")
     if not os.path.exists(db_path):
         return []
 
-    conn = sqlite3.connect(db_path)
     cutoff = time.time() - (lookback_hours * 3600)
-    rows = conn.execute(
-        """
-        SELECT m.content
-        FROM sessions AS s
-        JOIN messages AS m ON m.session_id = s.id
-        WHERE s.started_at > ?
-          AND COALESCE(s.archived, 0) = 0
-          AND m.active = 1
-          AND m.role = 'tool'
-          AND m.tool_name = 'skill_view'
-        ORDER BY s.started_at DESC, m.id
-        """,
-        (cutoff,),
-    ).fetchall()
-    conn.close()
+    with closing(connect_readonly(db_path)) as conn:
+        rows = conn.execute(
+            """
+            SELECT m.content
+            FROM sessions AS s
+            JOIN messages AS m ON m.session_id = s.id
+            WHERE s.started_at > ?
+              AND COALESCE(s.archived, 0) = 0
+              AND m.active = 1
+              AND m.role = 'tool'
+              AND m.tool_name = 'skill_view'
+            ORDER BY s.started_at DESC, m.id
+            """,
+            (cutoff,),
+        ).fetchall()
 
     skill_counts: Dict[str, int] = {}
     first_seen: Dict[str, int] = {}
@@ -282,9 +280,14 @@ def run_nightly(
     edit_budget: int = 4,
     backend: str = "mock",
     dry_run: bool = False,
+    skills_dir: str = "",
+    staging_root: str = "",
 ) -> List[dict]:
     """Run sleep cycle for specified skills (or auto-detect recently used ones)."""
     from hermes_skillopt.sleep import run_hermes_sleep
+
+    # Resolved per call, not bound at import, so a caller can redirect staging.
+    staging_root = staging_root or STAGING_ROOT
 
     if skills is None:
         skills = recently_used_skills(hermes_home, lookback_hours)
@@ -300,6 +303,7 @@ def run_nightly(
             report = run_hermes_sleep(
                 skill_name=skill_name,
                 hermes_home=hermes_home,
+                skills_dir=skills_dir,
                 lookback_hours=lookback_hours,
                 max_sessions=max_sessions,
                 max_tasks=max_tasks,
@@ -328,16 +332,21 @@ def run_nightly(
 
         # Stage the proposal
         if not dry_run and report.get("edits") and report.get("accepted"):
-            # Reconstruct the actual live path
-            import glob
-            pattern = os.path.join(hermes_home or HERMES_HOME, "skills", "**", skill_name, "SKILL.md")
-            matches = glob.glob(pattern, recursive=True)
-            live_path = matches[0] if matches else ""
+            # Use the path the optimizer actually read. Re-resolving it here once
+            # allowed the proposal to be staged against a different file than the
+            # one it was derived from — the hashes would still verify, because each
+            # was taken from a different file.
+            live_path = report.get("live_skill_path", "")
+            if not live_path:
+                print("no live path; not staged")
+                results.append({"skill": skill_name, "skipped": "unresolved live skill path"})
+                continue
 
             staging_path = write_staging_report(
                 skill_name, report,
                 report.get("proposed_skill"),
                 live_path,
+                staging_root,
             )
             print(f"         → staged: {staging_path}")
 
@@ -349,6 +358,7 @@ def run_nightly(
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 def main():
+    enable_utf8_output()
     parser = argparse.ArgumentParser(
         prog="hermes-skillopt",
         description="On-demand SkillOpt-Sleep for Hermes Agent"
@@ -362,6 +372,8 @@ def main():
     parser.add_argument("--edit-budget", type=int, default=4)
     parser.add_argument("--backend", default="mock", choices=["mock", "claude", "codex"])
     parser.add_argument("--hermes-home", default="")
+    parser.add_argument("--skills-dir", default="",
+                        help="Skills directory (default: <hermes-home>/skills)")
     parser.add_argument("--adopt", action="append", dest="adopt_skills",
                         help="Adopt staged proposals for skill(s)")
     parser.add_argument("--list-staged", action="store_true", help="List staged proposals")
@@ -410,7 +422,7 @@ def cmd_list_staged(args) -> int:
         if not os.path.exists(manifest_path):
             continue
 
-        with open(manifest_path) as f:
+        with open(manifest_path, encoding="utf-8") as f:
             m = json.load(f)
 
         skill = m.get("skill_name", d)
@@ -420,7 +432,7 @@ def cmd_list_staged(args) -> int:
         # Read score from report
         score_line = ""
         if os.path.exists(report_path):
-            with open(report_path) as f:
+            with open(report_path, encoding="utf-8") as f:
                 for line in f:
                     if "Score:" in line:
                         score_line = line.strip()
@@ -453,6 +465,7 @@ def cmd_adopt_all() -> int:
 def cmd_run(args) -> int:
     results = run_nightly(
         hermes_home=args.hermes_home,
+        skills_dir=args.skills_dir,
         skills=args.skills,
         lookback_hours=args.lookback_hours,
         max_sessions=args.max_sessions,
