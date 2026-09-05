@@ -152,6 +152,65 @@ which was wrong, beat an honest "Not yet, I can't verify that". That turn ran
 `--allow-unreplayable` mines them anyway. The scores then reward guessing, and
 the run says so.
 
+### Turns that drifted off the skill
+
+Attribution is sticky. `active_skills` accumulates and is never cleared, so one
+`skill_view` at turn 1 makes every later turn in that session a task for that
+skill, however far the conversation travels.
+
+Measured on `daily-ai-news-digest`: **210 of 242 attributed turns had drifted off
+the subject**, and all five that the miner actually selected were AIMentor
+engineering chat from two sessions that opened as a digest and wandered.
+
+```
+'Can you explain this repo to me in leymans terms?'
+'why was that? How is our exisiting embedding-based router so much better?'
+'so essentially by getting new message protoypes and continually training...'
+```
+
+A real run on those tasks proposed three rules, and the gate accepted them at
+0.50 to 0.67. One of them reads "a conversational follow-up about a project
+comparison is not a digest request; do not apply this pipeline" - a rational
+answer to the wrong question, bolted onto a skill whose job is producing digests.
+The gate cannot catch this. It scores whether an edit helps on the tasks it is
+given, and cannot know the tasks are the wrong ones.
+
+The two filters compound rather than cancel. A real digest turn uses
+`web_extract` and `browser_*`, so the replayability filter drops the skill's
+actual work and keeps the toolless conversational drift. The surviving set is
+close to the inverse of what the skill does.
+
+So a turn is kept only if it still looks like the skill's subject, scored against
+an anchor built from that skill's own `description`, Purpose and Trigger. Ground
+truth is the turn's own `skill_view`: a turn the agent loaded the skill to answer
+is on-topic by construction, is never filtered, and is what the threshold is
+calibrated from.
+
+| scorer | keeps of in-turn | keeps of inherited |
+|---|---|---|
+| embedding (all-MiniLM-L6-v2) | 67.5% | 39.3% |
+| lexical (idf token overlap) | 80.6% | 65.8% |
+
+Over 200 sessions and 6,219 attributed turns. The embedding separates about twice
+as well and is the default when `pip install hermes-skillopt[topic]` has been
+run; it pulls torch, so the fallback is standard-library token overlap. Lexical
+scores are zero-inflated, dropping honest follow-ups that use synonyms, so it is
+a fallback rather than an equivalent.
+
+**Thresholds are per skill, never global.** In-turn medians ran from 0.150
+(`hermes-agent`) to 0.342 (`daily-ai-news-digest`) under the same scorer, so one
+cutoff would gut one skill and pass another. The threshold is
+`0.7 x that skill's own in-turn median`: at 0.7 the known-bad tasks go and 67.5%
+of by-construction on-topic turns stay, where 1.0 drops all of them but keeps
+only 51%. A skill with fewer than five in-turn turns cannot be calibrated at all,
+and then only its in-turn turns are kept, so the run reports too few tasks rather
+than optimizing on turns nothing established belong to it.
+
+It is better, not perfect. After the filter the five tasks above are gone and
+what survives is digest work ("Can we edit my AI news digest", "news can change a
+previous blocker"), but one or two survivors are still arguable. `--allow-off-topic`
+keeps everything, and the run says how many were dropped.
+
 ### The filter is necessary and not sufficient
 
 Tools are one of two things replay does not have. The other was the conversation.
@@ -523,6 +582,7 @@ python -m venv /tmp/v020 && /tmp/v020/bin/pip install "skillopt==0.2.0" pytest -
 | `hermes_skillopt/sleep.py` | Session harvesting, skill attribution, task mining |
 | `hermes_skillopt/backend.py` | Hermes-specific pattern reflection |
 | `hermes_skillopt/llm_backend.py` | Real replay transport, loud-failure guard, pairwise judge |
+| `hermes_skillopt/topic.py` | Drift filter: is a turn still about the skill it was attributed to |
 | `hermes_skillopt/run_nightly.py` | On-demand staging and safe adoption CLI |
 | `tests/` | Session-mining and adoption regression tests |
 | `experiments/` | Live judge measurements: separation, replayability tiers, grounding |
@@ -550,6 +610,14 @@ python -m venv /tmp/v020 && /tmp/v020/bin/pip install "skillopt==0.2.0" pytest -
   Comparison is still the stronger guard, so use `--judge pairwise`. See "What
   the grounding requirement changed".
 - Skill attribution is session/turn based and depends on successful `skill_view` tool results.
+- **The drift filter is a similarity threshold, not an understanding of the
+  skill.** It reliably drops a turn about another project, which is the failure
+  that motivated it, and it cannot tell an on-topic follow-up from an off-topic
+  one that happens to share vocabulary. Calibration also needs five in-turn turns
+  before it can place a threshold at all; measured over 200 sessions, only 30 of
+  80 attributed skills had enough, and the rest fall back to keeping in-turn
+  turns only. Read the dropped count in the report rather than assuming the pool
+  is what you expect.
 - The miner drops roughly half of all turns as unreplayable. Optimizing a skill
   whose work is mostly tool-driven means optimizing the minority of it that is
   conversation.

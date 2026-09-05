@@ -14,6 +14,13 @@ outside site-packages, which is the tell.
 import importlib.metadata as metadata
 import os
 
+# Run the scorer a machine without the optional [topic] extra runs, which is also
+# what CI runs. Left to itself the suite would pick the embedding scorer on any
+# developer box that happens to have torch, testing a configuration CI never
+# exercises and paying 15 seconds to load a transformer for tests that are about
+# task mining. tests/test_topic.py covers the embedding path on its own terms.
+os.environ.setdefault("HERMES_SKILLOPT_TOPIC_SCORER", "lexical")
+
 
 def pytest_report_header(config):
     try:

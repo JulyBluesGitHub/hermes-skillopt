@@ -63,3 +63,25 @@ request already contains.
 
 The bar is that the right answer wins all four. Before the grounding
 requirement it won three; the confident guess took the fourth in both orders.
+
+## `topic_drift.py`
+
+```bash
+python experiments/topic_drift.py out.json
+```
+
+Scores every attributed turn against its skill's anchor and reports what a
+threshold would keep. CPU only, no API calls, about a minute for 200 sessions.
+
+Ground truth is the turn's own `skill_view`: a turn the agent loaded the skill to
+answer is on-topic by construction, and those are the only labels the transcripts
+carry for free. Inherited turns are the population in question and are reported
+as a distribution rather than scored as errors, since some are honest follow-ups
+and some are drift.
+
+Run it before changing `DEFAULT_FRACTION` or the anchor in
+`hermes_skillopt/topic.py`. It is also what shows that a global threshold cannot
+work: per-skill in-turn medians ran from 0.150 to 0.342 under one scorer.
+
+Set `HERMES_SKILLOPT_TOPIC_SCORER=lexical` to compare the fallback scorer against
+the embedding on the same turns.

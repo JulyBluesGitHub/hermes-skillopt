@@ -515,6 +515,50 @@ def turn_needs_tools(record: "PromptRecord") -> List[str]:
     return [t for t in record.tools_used if t not in REPLAYABLE_TOOLS]
 
 
+def _on_topic_lookup(
+    sessions: List[HermesSession],
+    skill_name: str,
+    skill_text: str,
+    *,
+    enabled: bool,
+    stats: Optional[Dict[str, float]] = None,
+) -> Optional[Dict[Tuple[str, int], bool]]:
+    """``(session_id, turn_index) -> keep``, or None when no filtering applies.
+
+    None rather than an all-True map, so the caller can tell "not filtering" from
+    "filtered and everything passed". Filtering needs a named skill: the anchor is
+    built from one skill's front matter, and mining every skill at once has no
+    single subject to compare a turn against.
+    """
+    if not enabled or not skill_name:
+        return None
+
+    from hermes_skillopt import topic
+
+    keys, prompts, in_turn = [], [], []
+    for session in sessions:
+        if not session.completed or skill_name not in session.skills_loaded:
+            continue
+        for index, record in enumerate(session.prompt_records):
+            if skill_name not in record.skills_loaded:
+                continue
+            keys.append((session.session_id, index))
+            prompts.append(record.prompt)
+            in_turn.append("skill_view" in record.tools_used)
+
+    if not keys:
+        return None
+    flags = topic.on_topic_flags(
+        topic.get_scorer(),
+        topic.build_anchor(skill_text, skill_name),
+        prompts, in_turn, stats=stats,
+    )
+    if stats is not None:
+        stats["n_attributed"] = len(keys)
+        stats["n_on_topic"] = sum(flags)
+    return dict(zip(keys, flags))
+
+
 def mine_hermes_tasks(
     sessions: List[HermesSession],
     skill_name: str = "",
@@ -522,6 +566,9 @@ def mine_hermes_tasks(
     *,
     require_replayable: bool = True,
     skipped: Optional[Dict[str, int]] = None,
+    require_on_topic: bool = True,
+    skill_text: str = "",
+    topic_stats: Optional[Dict[str, float]] = None,
 ) -> List[TaskRecord]:
     """Convert Hermes sessions into SkillOpt TaskRecords.
 
@@ -545,9 +592,30 @@ def mine_hermes_tasks(
 
     Pass ``require_replayable=False`` to mine them anyway, and ``skipped`` to
     receive a tool-name histogram of what was dropped.
+
+    Turns that drifted off the skill's subject are dropped too. Attribution is
+    sticky - ``active_skills`` accumulates and is never cleared - so one
+    ``skill_view`` at turn 1 makes every later turn in that session a task for
+    that skill. Measured on ``daily-ai-news-digest``, all five mined tasks were
+    AIMentor engineering chat from sessions that opened as a digest and wandered,
+    and the optimizer wrote news-skill rules out of a conversation about
+    retrieval routing. The two filters compound: a real digest turn uses the
+    browser, so the replayability filter drops the skill's actual work and keeps
+    the toolless drift. See :mod:`hermes_skillopt.topic`. Pass
+    ``require_on_topic=False`` to keep them, and ``topic_stats`` to learn which
+    scorer ran and where the threshold landed.
     """
     tasks = []
     task_id = 0
+
+    # Which turns are still about this skill. Calibration reads every attributed
+    # turn, including ones the replayability filter will drop: the reference set
+    # is turns whose own skill_view fired, and those routinely used other tools
+    # too. Filtering first would calibrate against the handful that survive.
+    on_topic = _on_topic_lookup(
+        sessions, skill_name, skill_text,
+        enabled=require_on_topic, stats=topic_stats,
+    )
 
     for session in sessions:
         if not session.completed:
@@ -557,6 +625,10 @@ def mine_hermes_tasks(
 
         for index, record in enumerate(session.prompt_records):
             if skill_name and skill_name not in record.skills_loaded:
+                continue
+            if on_topic is not None and not on_topic.get((session.session_id, index), False):
+                if skipped is not None:
+                    skipped["(off-topic)"] = skipped.get("(off-topic)", 0) + 1
                 continue
             needed = turn_needs_tools(record)
             if require_replayable and needed:
@@ -616,6 +688,7 @@ def run_hermes_sleep(
     model: str = "",
     judge_mode: str = "absolute",
     require_replayable: bool = True,
+    require_on_topic: bool = True,
 ) -> Dict[str, Any]:
     """Run one sleep cycle for a Hermes skill.
 
@@ -634,22 +707,45 @@ def run_hermes_sleep(
     # Mine. Turns that used tools replay cannot supply are dropped by default —
     # see mine_hermes_tasks for why scoring them rewards confident guessing.
     skipped: Dict[str, int] = {}
+    topic_stats: Dict[str, float] = {}
+    # Read before mining: the topic anchor is built from this skill's own front
+    # matter, and mining is what needs it. The path is resolved once more below
+    # for the report, deliberately from the same call.
+    skill_text_for_anchor = load_hermes_skill(skill_name, skills_dir=skills_dir,
+                                              hermes_home=hermes_home)
     tasks = mine_hermes_tasks(
         sessions, skill_name=skill_name, max_tasks=max_tasks,
         require_replayable=require_replayable, skipped=skipped,
+        require_on_topic=require_on_topic, skill_text=skill_text_for_anchor,
+        topic_stats=topic_stats,
     )
 
     if not tasks:
-        n_skipped = sum(skipped.values())
-        if n_skipped:
+        # Two filters can empty the pool and they need opposite advice, so the
+        # message names whichever did it. Telling someone to pass
+        # --allow-unreplayable when every turn was dropped as off-topic sends
+        # them to mine turns that will be dropped again.
+        off_topic = skipped.get("(off-topic)", 0)
+        by_tool = {k: v for k, v in skipped.items() if k != "(off-topic)"}
+        if off_topic and not by_tool:
+            return {"error": "no_on_topic_tasks",
+                    "message": f"Every turn attributed to '{skill_name}' had drifted off "
+                               f"its subject ({off_topic} dropped). Attribution is sticky: "
+                               f"one skill_view makes every later turn in that session a "
+                               f"task for the skill. Pass --allow-off-topic to mine them "
+                               f"anyway, knowing the optimizer will write rules for this "
+                               f"skill out of another subject."}
+        if by_tool:
             top = ", ".join(f"{k} ({v})" for k, v in
-                            sorted(skipped.items(), key=lambda kv: -kv[1])[:5])
+                            sorted(by_tool.items(), key=lambda kv: -kv[1])[:5])
+            extra = (f" A further {off_topic} had drifted off the skill's subject; "
+                     f"--allow-off-topic keeps those." if off_topic else "")
             return {"error": "no_replayable_tasks",
                     "message": f"Every mined turn for '{skill_name}' used tools replay "
                                f"cannot supply (most often: {top}). Replaying them would "
                                f"score the model on a task it cannot perform. Pass "
                                f"--allow-unreplayable to mine them anyway, knowing the "
-                               f"scores reward guessing."}
+                               f"scores reward guessing.{extra}"}
         return {"error": "no_tasks", "message": "No tasks could be mined from sessions."}
 
     # Assign train/val splits
@@ -732,8 +828,13 @@ def run_hermes_sleep(
         "accepted": result.accepted,
         "gate_action": result.gate_action,
         "judge_mode": judge_mode,
-        "n_skipped_unreplayable": sum(skipped.values()),
-        "skipped_tools": dict(sorted(skipped.items(), key=lambda kv: -kv[1])[:10]),
+        "n_skipped_off_topic": skipped.get("(off-topic)", 0),
+        "topic_filter": dict(topic_stats),
+        "n_skipped_unreplayable": sum(
+            v for k, v in skipped.items() if k != "(off-topic)"),
+        "skipped_tools": dict(sorted(
+            ((k, v) for k, v in skipped.items() if k != "(off-topic)"),
+            key=lambda kv: -kv[1])[:10]),
         "edits": [
             {"target": e.target, "op": e.op, "content": e.content, "rationale": e.rationale}
             for e in result.applied_edits

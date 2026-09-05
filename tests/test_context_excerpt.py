@@ -269,7 +269,11 @@ def test_a_mined_task_carries_the_conversation_that_preceded_it(tmp_path):
     )
 
     sessions = harvest_hermes_sessions(str(home))
-    tasks = mine_hermes_tasks(sessions, skill_name="digest")
+    # require_on_topic=False because this fixture is the drift shape itself: a
+    # digest session whose second turn asks about a repo. The topic filter drops
+    # exactly that (see test_topic.py), and this test is about what the excerpt
+    # carries, not about which turns survive attribution.
+    tasks = mine_hermes_tasks(sessions, skill_name="digest", require_on_topic=False)
 
     # The `terminal` turn is unreplayable and dropped; the turn after it is mined.
     assert [task.intent for task in tasks] == ["explain this repo to me"]

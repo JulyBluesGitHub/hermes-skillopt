@@ -24,6 +24,12 @@ classifiers = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "ruff>=0.11"]
+# The topic filter's stronger scorer. Optional because sentence-transformers
+# pulls torch, which is a large install to impose on a package whose other
+# dependency is a single pure-python one. Without it the filter falls back to
+# idf-weighted token overlap, which separates about half as well; see
+# hermes_skillopt/topic.py for the measurement.
+topic = ["sentence-transformers>=2.2"]
 
 [project.scripts]
 hermes-skillopt = "hermes_skillopt.run_nightly:main"

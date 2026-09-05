@@ -67,8 +67,12 @@ def test_long_requests_are_bounded_but_generous():
 
 
 def test_mined_tasks_carry_a_rubric_and_a_clean_intent():
+    # tools_used carries skill_view because harvesting only ever sets
+    # skills_loaded from one: a record attributed to a skill with no skill_view
+    # anywhere is not a state the miner can see.
     record = PromptRecord(prompt="Ship the changelog", response="done",
-                          outcome="success", skills_loaded=["demo"])
+                          outcome="success", skills_loaded=["demo"],
+                          tools_used=["skill_view"])
     session = HermesSession(
         session_id="s1", title="t", cwd="", model="gpt-5.6-sol",
         started_at=0.0, ended_at=1.0, completed=True,
