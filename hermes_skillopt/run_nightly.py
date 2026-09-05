@@ -285,6 +285,7 @@ def run_nightly(
     agent_path: str = "",
     model: str = "",
     judge_mode: str = "absolute",
+    require_replayable: bool = True,
 ) -> List[dict]:
     """Run sleep cycle for specified skills (or auto-detect recently used ones)."""
     from hermes_skillopt.sleep import run_hermes_sleep
@@ -316,6 +317,7 @@ def run_nightly(
                 agent_path=agent_path,
                 model=model,
                 judge_mode=judge_mode,
+                require_replayable=require_replayable,
             )
         except Exception as e:
             print(f"ERROR: {e}")
@@ -380,6 +382,10 @@ def main():
                         help="mock = offline heuristics (cannot validate); hermes = replay via "
                              "Hermes's configured providers")
     parser.add_argument("--model", default="", help="Override the replay model")
+    parser.add_argument("--allow-unreplayable", action="store_true",
+                        help="Mine turns that used tools replay cannot supply. Off by "
+                             "default: replay has no tools, so those turns score "
+                             "confident guessing above an honest 'I cannot verify this'")
     parser.add_argument("--judge", default="absolute", choices=["absolute", "pairwise"],
                         dest="judge_mode",
                         help="absolute: rate each response 0..1. pairwise: compare each "
@@ -488,6 +494,7 @@ def cmd_run(args) -> int:
         edit_budget=args.edit_budget,
         backend=args.backend,
         judge_mode=args.judge_mode,
+        require_replayable=not args.allow_unreplayable,
         agent_path=args.hermes_agent_path,
         model=args.model,
         dry_run=args.dry_run,

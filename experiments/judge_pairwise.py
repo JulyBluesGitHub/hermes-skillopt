@@ -11,6 +11,7 @@ text is reused — so any difference in separation is the judge, not the sampler
 Bar: good beats baseline (>0.5) and bad loses to it (<0.5).
 """
 
+import hashlib
 import io
 import json
 import os
@@ -27,13 +28,17 @@ from hermes_skillopt.sleep import (
 SKILL = "daily-ai-news-digest"
 N_TASKS = 4
 
+# The previous good edit ("tool access is unavailable, answer anyway") is exactly
+# the harness workaround the replayability filter exists to stop rewarding. With
+# the filter on, the mined turns do not need tools, so a helpful edit has to be a
+# real improvement to the answers rather than a way around the sandbox.
 GOOD_EDIT = """
 
 ## Learned preferences
-You are answering from your own knowledge; live tool access is not available in
-this context. Do not decline, and do not describe what you would do if you had
-tools. Give the best substantive answer you can from what you already know, and
-state your assumptions and their date explicitly.
+Lead with the direct answer in one sentence, then the reasoning behind it. Define
+every acronym, internal codename and project-specific term the first time it
+appears. When comparing two approaches, say which is better and why, rather than
+listing properties of each and leaving the comparison to the reader.
 """
 
 BAD_EDIT = """
@@ -61,6 +66,11 @@ def main() -> int:
     # Cached on disk: attempts are the expensive half (12 calls at ~2 min each),
     # and rerunning the judge should not mean re-sampling the responses. Reusing
     # the same text across runs also keeps the comparison about the judge.
+    #
+    # Keyed on the request text, never on task.id. Ids are positional, so the
+    # replayability filter renumbers them — hermes-1 after the filter is a
+    # different turn than hermes-1 before it, and an id-keyed cache would hand
+    # back another task's answer without anything looking wrong.
     cache_path = sys.argv[2] if len(sys.argv) > 2 else ""
     cache = {}
     if cache_path and os.path.isfile(cache_path):
@@ -69,7 +79,7 @@ def main() -> int:
     responses = {}
     for name, skill in arms.items():
         for task in tasks:
-            key = f"{name}|{task.id}"
+            key = f"{name}|{hashlib.sha256(task.intent.encode()).hexdigest()[:16]}"
             if key in cache:
                 responses[(name, task.id)] = cache[key]
                 print(f"  cached  {name:9s} {task.id[:14]:14s} "

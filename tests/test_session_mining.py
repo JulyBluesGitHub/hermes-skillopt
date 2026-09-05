@@ -96,7 +96,9 @@ def test_successful_tool_payload_with_null_error_is_not_a_failure(tmp_path):
     )
 
     session = harvest_hermes_sessions(str(home))[0]
-    tasks = mine_hermes_tasks([session])
+    # These turns ran `terminal`, so the replayability filter drops them; this
+    # test is about the outcome label, not about whether replay is a fair test.
+    tasks = mine_hermes_tasks([session], require_replayable=False)
 
     assert tasks[0].outcome == "success"
     assert tasks[0].attempted_solution == "The check passed."
@@ -117,7 +119,7 @@ def test_recovered_tool_error_is_mixed_and_keeps_final_response(tmp_path):
     )
 
     session = harvest_hermes_sessions(str(home))[0]
-    tasks = mine_hermes_tasks([session])
+    tasks = mine_hermes_tasks([session], require_replayable=False)
 
     assert tasks[0].outcome == "mixed"
     assert tasks[0].attempted_solution == "I used a fallback and completed the check."
