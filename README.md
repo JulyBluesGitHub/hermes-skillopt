@@ -489,17 +489,30 @@ CI runs lint and tests on Python 3.10, 3.11, and 3.12.
 
 ### Test against the published `skillopt`, not only a local checkout
 
-`pyproject.toml` asks for `skillopt>=0.1.0`, and the two published versions do not
-call this package the same way. 0.2.0 passes `sample_id` through `replay_one` so
-repeated rollouts stop sharing one cache slot. A developer with the upstream repo
-checked out at 0.1.0 gets a green suite while an install from PyPI is broken,
-which is how a fixed-signature wrapper shipped on `main`.
+A local editable checkout of upstream and a `pip install` from PyPI are not the
+same package, and they can carry the same version number while shipping different
+modules.
 
-The wrappers now forward `*args`/`**kwargs` everywhere they delegate, and a test
-covers it. Before changing one, check both:
+`pyproject.toml` asked for `skillopt>=0.1.0` until 2026-09-05. Published 0.1.0
+ships `skillopt`, `skillopt_webui` and `scripts`, and no `skillopt_sleep`, which
+is the module every file here imports. Anything that resolved to it installed
+cleanly and then raised `ModuleNotFoundError` on the first import, so the floor
+described a configuration that never worked. The workstation that wrote this code
+did not notice, because its editable checkout of upstream `main` also calls itself
+0.1.0 and does have `skillopt_sleep`. The floor is now `>=0.2.0`, and CI installs
+it exactly so the claim is checked rather than asserted.
+
+The versions also call this package differently. 0.2.0 passes `sample_id` through
+`replay_one` so repeated rollouts stop sharing one cache slot, and a
+fixed-signature wrapper here raised `TypeError` on every replay against it. The
+wrappers now forward `*args`/`**kwargs` everywhere they delegate, and a test
+covers it. `pytest` prints the resolved `skillopt` version and path in its header,
+so a green run says which version it was green against.
+
+Before changing a wrapper, check a clean install rather than only this machine:
 
 ```bash
-python -m venv /tmp/v020 && /tmp/v020/bin/pip install "skillopt==0.2.0" pytest -e .
+python -m venv /tmp/v020 && /tmp/v020/bin/pip install "skillopt==0.2.0" pytest -e . --no-deps
 /tmp/v020/bin/python -m pytest -q
 ```
 
