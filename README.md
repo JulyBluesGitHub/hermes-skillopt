@@ -210,6 +210,7 @@ CI runs lint and tests on Python 3.10, 3.11, and 3.12.
 ## Known limitations
 
 - Outcome labels are inferred from transcripts; explicit human quality labels are not yet stored by Hermes.
+- Judge scores are coarse: a subtle edit can improve a response without moving the score.
 - Skill attribution is session/turn based and depends on successful `skill_view` tool results.
 - The default mock backend cannot demonstrate score lift; use `--backend hermes` to validate.
 - Staging directories created before v0.2.0 lack safety hashes and are refused; regenerate them.
