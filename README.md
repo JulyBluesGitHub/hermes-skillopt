@@ -217,6 +217,38 @@ Over real history this fired 64 times — mostly `read_file` on a config with
 This does not make an unreplayable turn replayable, and the tool filter still
 runs: a turn that needed to *run* something is still dropped.
 
+### What filling it measured
+
+`experiments/judge_pairwise.py`, same four tasks and the same three arms, before
+and after. The attempt cache is keyed on the request text, so the excerpt change
+re-samples every response on its own.
+
+| pairwise separation | good vs baseline | bad vs baseline | good > baseline > bad |
+|---|---|---|---|
+| before the tool filter | +0.375 | −0.125 | yes — but the run contained the `"Yes."` pathology |
+| after it, empty excerpt | −0.125 | −0.125 | no |
+| after it, filled excerpt | −0.250 | **−0.500** | no |
+
+**Half the gate now works.** The bad edit — ten-word answers, no reasoning —
+lost every task in both orders, where before it won one and tied another. A
+harmful edit can no longer clear the gate by being confidently terse, because
+the baseline it is compared against now has something real to say: every
+baseline answer cites facts from the conversation, and none of them open by
+declining. The absolute judge spreads over five distinct values rather than
+clustering, for the same reason.
+
+**Certifying a helpful edit still does not work.** The good edit lost two tasks
+and tied two. Reading the responses says why, and it is not the missing context:
+both arms now quote the branch, the commit and the CI result out of the excerpt.
+The excerpt is a transcript, not a working directory — asked to explain a repo,
+the model has what an earlier turn *said* about the code, not the code — so an
+answer that marks that limit still reads to the judge as the hedging the rubric
+penalizes. That is the grounding defect in `build_task_rubric`, which was
+downstream of replay fidelity and is now the binding constraint.
+
+So the gate is sound in the direction that matters for safety — it rejects harm —
+and cannot yet be used to accept an improvement on its own evidence.
+
 ## Outcome labels
 
 Hermes SkillOpt uses conservative weak labels:
@@ -407,7 +439,9 @@ python -m venv /tmp/v020 && /tmp/v020/bin/pip install "skillopt==0.2.0" pytest -
   never requires it to be *right*. `"Yes."` is maximally direct, and an honest
   "I can't verify this" reads to the judge as the hedging the rubric penalizes.
   Until the rubric carries a grounding requirement, a confidently wrong edit can
-  still clear the gate.
+  still clear the gate. Filling `context_excerpt` removed the version of this
+  that came from missing context, and left the rubric defect itself standing as
+  the binding constraint — see "What filling it measured".
 - Skill attribution is session/turn based and depends on successful `skill_view` tool results.
 - Roughly half of mined turns are dropped as unreplayable. Optimizing a skill whose
   work is mostly tool-driven means optimizing the minority of it that is conversation.
