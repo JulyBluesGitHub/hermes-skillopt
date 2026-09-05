@@ -159,17 +159,28 @@ class HermesSession:
 
 #: Per-message ceiling inside a context excerpt. Tool dumps are unbounded —
 #: a directory listing or a file read would otherwise consume the whole budget.
-_CONTEXT_MESSAGE_CHARS = 400
+#:
+#: This one also applies at *harvest*, so it is the constant that decides what
+#: is ever available to render: raising ``_CONTEXT_CHARS`` alone admits nothing
+#: new, because the results were already cut on the way in.
+_CONTEXT_MESSAGE_CHARS = 1200
 
 #: Budget for one excerpt, spent newest-turn-first because the turn immediately
 #: before the task is the one whose result the task refers to. A single turn
 #: larger than this is still rendered whole — trimming it would cost the reply
 #: at its end, and dropping it would leave the excerpt empty.
-_CONTEXT_CHARS = 2000
+_CONTEXT_CHARS = 8000
 
 #: Tool results kept per rendered turn, counting back from the last. A turn can
 #: call a tool twenty times; the calls that produced the reply are the late ones.
-_CONTEXT_TOOLS_PER_TURN = 4
+#:
+#: The three numbers above were first set to 400/2000/4, which measured badly on
+#: real history: 63.5% of captured results hit the per-message cap, 71.3% of
+#: calls fell outside the per-turn keep, and only 8.2% of available preceding
+#: turns were rendered at all. `read_file` is the second most-used tool in this
+#: history, so the code a mined turn asks about was being read and then thrown
+#: away here.
+_CONTEXT_TOOLS_PER_TURN = 8
 
 #: Redacted before any excerpt leaves this process. Filling the excerpt means
 #: shell output and file contents now reach a model provider, which they did

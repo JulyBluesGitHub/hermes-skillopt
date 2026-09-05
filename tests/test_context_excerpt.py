@@ -14,6 +14,9 @@ must never leak.
 import json
 
 from hermes_skillopt.sleep import (
+    _CONTEXT_CHARS,
+    _CONTEXT_MESSAGE_CHARS,
+    _CONTEXT_TOOLS_PER_TURN,
     HermesSession,
     PromptRecord,
     build_context_excerpt,
@@ -108,46 +111,54 @@ def test_a_turn_with_no_reply_still_contributes_its_request():
 
 # ── what the excerpt spends ──────────────────────────────────────────────────
 
+#: A message long enough to be capped, whatever the caps are currently set to.
+_LONG = "padding " * (_CONTEXT_MESSAGE_CHARS // 4)
+
+
 def test_the_budget_keeps_the_turns_nearest_the_task():
     """Overflow drops the oldest turns, because the request refers back nearby."""
+    # Each turn is worth at least two capped messages, so this always overflows.
+    count = _CONTEXT_CHARS // _CONTEXT_MESSAGE_CHARS + 2
     session = _session(
-        *[_turn(f"turn {i} " + "padding " * 60, f"reply {i} " + "filler " * 60)
-          for i in range(8)],
+        *[_turn(f"turn {i} " + _LONG, f"reply {i} " + _LONG) for i in range(count)],
         _turn("the mined request"),
     )
 
-    excerpt = build_context_excerpt(session, 8)
+    excerpt = build_context_excerpt(session, count)
 
-    assert "turn 7" in excerpt
+    assert f"turn {count - 1}" in excerpt
     assert "turn 0" not in excerpt
-    assert len(excerpt) < 3000
+    assert len(excerpt) < _CONTEXT_CHARS + 3 * _CONTEXT_MESSAGE_CHARS
 
 
 def test_a_single_oversized_turn_is_kept_rather_than_dropped():
     """Trimming it would cost the reply at its end; dropping it empties the excerpt."""
     session = _session(
-        _turn("q " + "x " * 500, "a " + "y " * 500,
-              tools=[("terminal", "z " * 500)]),
+        _turn("q " + _LONG, "a " + _LONG,
+              tools=[("terminal", f"{i} " + _LONG)
+                     for i in range(_CONTEXT_TOOLS_PER_TURN)]),
         _turn("the mined request"),
     )
 
     excerpt = build_context_excerpt(session, 1)
 
+    assert len(excerpt) > _CONTEXT_CHARS, "this turn must exceed the budget on its own"
     assert "[user]" in excerpt and "[assistant]" in excerpt
 
 
 def test_only_the_last_tool_results_of_a_turn_are_kept():
     """A turn can call a tool twenty times; the calls behind the reply are late."""
+    count = _CONTEXT_TOOLS_PER_TURN + 5
     session = _session(
         _turn("do it", "done",
-              tools=[("terminal", f"result {i}") for i in range(9)]),
+              tools=[("terminal", f"result {i}") for i in range(count)]),
         _turn("and now?"),
     )
 
     excerpt = build_context_excerpt(session, 1)
 
-    assert excerpt.count("[tool:terminal]") == 4
-    assert "result 8" in excerpt
+    assert excerpt.count("[tool:terminal]") == _CONTEXT_TOOLS_PER_TURN
+    assert f"result {count - 1}" in excerpt
     assert "result 0" not in excerpt
 
 
