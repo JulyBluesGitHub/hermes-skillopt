@@ -126,6 +126,31 @@ another while both hashes still verify.
 Session history is opened through a read-only SQLite connection, so a bug in
 this tool cannot mutate Hermes's `state.db`.
 
+## What gets mined
+
+Replay is a single-shot text call with **no tools**. A turn that shelled out to
+answer "can we push?" therefore cannot be replayed fairly: the model cannot run
+`git status`, correctly says it cannot verify, and the rubric marks that down as
+"describing how it would proceed". The optimizer's only way out is to propose a
+rule like *"do not decline, answer from what you know"* — which scores well in
+replay and is **actively harmful in production**, where the agent does have tools
+and the skill may carry a fail-closed rule saying not to guess.
+
+So turns that used tools replay cannot supply are not mined. `skill_view` is the
+one exception: replay puts the skill straight into the prompt, so loading it is
+genuinely reproduced — and skill attribution requires a successful `skill_view`,
+so counting it would exclude every task.
+
+Measured over 200 real sessions: 47% of turns attributed to one skill survive the
+filter, and 34% across all skills. The survivors are the explanatory turns
+("explain this repo", "what is X?") — the ones a toolless replay can honestly
+answer. The filter also drops the specific task that let a four-character
+`"Yes."`, which was **wrong**, beat an honest "Not yet, I can't verify that": the
+original turn ran `terminal`, so no replay of it could have known the answer.
+
+`--allow-unreplayable` mines them anyway. The scores then reward guessing, and
+the run says so.
+
 ## Outcome labels
 
 Hermes SkillOpt uses conservative weak labels:
@@ -310,6 +335,8 @@ python -m venv /tmp/v020 && /tmp/v020/bin/pip install "skillopt==0.2.0" pytest -
   Until the rubric carries a grounding requirement, a confidently wrong edit can
   still clear the gate.
 - Skill attribution is session/turn based and depends on successful `skill_view` tool results.
+- Roughly half of mined turns are dropped as unreplayable. Optimizing a skill whose
+  work is mostly tool-driven means optimizing the minority of it that is conversation.
 - The default mock backend cannot demonstrate score lift; use `--backend hermes` to validate.
 - Staging directories created before v0.2.0 lack safety hashes and are refused; regenerate them.
 

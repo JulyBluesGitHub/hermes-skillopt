@@ -20,7 +20,7 @@ import sys
 import time
 from contextlib import closing
 from dataclasses import dataclass, field
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from skillopt_sleep.consolidate import consolidate
 from skillopt_sleep.mine import assign_splits
@@ -128,6 +128,9 @@ class PromptRecord:
     outcome: str = "unknown"
     tool_errors: List[str] = field(default_factory=list)
     skills_loaded: List[str] = field(default_factory=list)
+    #: Every tool this turn called, in first-use order. Replay is a bare text
+    #: call, so this is what says whether replaying the turn is a fair test.
+    tools_used: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -263,6 +266,8 @@ def _build_session(conn: sqlite3.Connection, row: sqlite3.Row) -> HermesSession:
             s.assistant_responses.append(content[:1000])
         elif role == "tool" and msg["tool_name"]:
             tool_name = msg["tool_name"]
+            if current is not None and tool_name not in current.tools_used:
+                current.tools_used.append(tool_name)
             if tool_name == "skill_view":
                 skill_name = _skill_name_from_result(content)
                 if skill_name and skill_name not in active_skills:
@@ -323,15 +328,50 @@ def build_task_rubric(record: "PromptRecord") -> str:
         lines.append("- produce a real answer; this request previously went unanswered")
     return "\n".join(lines)
 
+#: Tools whose effect a bare text replay actually reproduces.
+#:
+#: ``skill_view`` loads a skill, and replay puts the skill straight into the
+#: prompt — so a turn that used it is still fairly replayable. It also has to be
+#: here for a second reason: skill attribution *requires* a successful
+#: ``skill_view``, so counting it as an external dependency would exclude every
+#: task this tool can see.
+#:
+#: Everything else reaches outside the prompt — the filesystem, a shell, a
+#: browser, the network, session-local todo state, the user. Replay has none of
+#: it, so replaying such a turn asks the model a different question than the one
+#: that was actually answered.
+REPLAYABLE_TOOLS = frozenset({"skill_view"})
+
+
+def turn_needs_tools(record: "PromptRecord") -> List[str]:
+    """Tools this turn used that replay cannot supply; empty means fairly replayable."""
+    return [t for t in record.tools_used if t not in REPLAYABLE_TOOLS]
+
+
 def mine_hermes_tasks(
     sessions: List[HermesSession],
     skill_name: str = "",
     max_tasks: int = 30,
+    *,
+    require_replayable: bool = True,
+    skipped: Optional[Dict[str, int]] = None,
 ) -> List[TaskRecord]:
     """Convert Hermes sessions into SkillOpt TaskRecords.
 
     Each "task" is derived from a user prompt paired with the assistant's
     response and any tool errors that followed.
+
+    Turns that used tools replay cannot supply are skipped by default. Replay is
+    a single-shot text call with no tools, so replaying such a turn scores the
+    model on a different task than the one that happened: it cannot fetch, read
+    or run anything, correctly says so, and the rubric marks that down as
+    "describing how it would proceed". The optimizer's way out is to propose
+    rules like "do not decline, answer from what you know" — which score well
+    in replay and are actively harmful in production, where the agent does have
+    tools and the skill may have a fail-closed rule saying not to guess.
+
+    Pass ``require_replayable=False`` to mine them anyway, and ``skipped`` to
+    receive a tool-name histogram of what was dropped.
     """
     tasks = []
     task_id = 0
@@ -344,6 +384,12 @@ def mine_hermes_tasks(
 
         for record in session.prompt_records:
             if skill_name and skill_name not in record.skills_loaded:
+                continue
+            needed = turn_needs_tools(record)
+            if require_replayable and needed:
+                if skipped is not None:
+                    for tool in needed:
+                        skipped[tool] = skipped.get(tool, 0) + 1
                 continue
             task_id += 1
 
@@ -398,6 +444,7 @@ def run_hermes_sleep(
     agent_path: str = "",
     model: str = "",
     judge_mode: str = "absolute",
+    require_replayable: bool = True,
 ) -> Dict[str, Any]:
     """Run one sleep cycle for a Hermes skill.
 
@@ -413,10 +460,25 @@ def run_hermes_sleep(
     if not sessions:
         return {"error": "no_sessions", "message": "No recent Hermes sessions found."}
 
-    # Mine
-    tasks = mine_hermes_tasks(sessions, skill_name=skill_name, max_tasks=max_tasks)
+    # Mine. Turns that used tools replay cannot supply are dropped by default —
+    # see mine_hermes_tasks for why scoring them rewards confident guessing.
+    skipped: Dict[str, int] = {}
+    tasks = mine_hermes_tasks(
+        sessions, skill_name=skill_name, max_tasks=max_tasks,
+        require_replayable=require_replayable, skipped=skipped,
+    )
 
     if not tasks:
+        n_skipped = sum(skipped.values())
+        if n_skipped:
+            top = ", ".join(f"{k} ({v})" for k, v in
+                            sorted(skipped.items(), key=lambda kv: -kv[1])[:5])
+            return {"error": "no_replayable_tasks",
+                    "message": f"Every mined turn for '{skill_name}' used tools replay "
+                               f"cannot supply (most often: {top}). Replaying them would "
+                               f"score the model on a task it cannot perform. Pass "
+                               f"--allow-unreplayable to mine them anyway, knowing the "
+                               f"scores reward guessing."}
         return {"error": "no_tasks", "message": "No tasks could be mined from sessions."}
 
     # Assign train/val splits
@@ -499,6 +561,8 @@ def run_hermes_sleep(
         "accepted": result.accepted,
         "gate_action": result.gate_action,
         "judge_mode": judge_mode,
+        "n_skipped_unreplayable": sum(skipped.values()),
+        "skipped_tools": dict(sorted(skipped.items(), key=lambda kv: -kv[1])[:10]),
         "edits": [
             {"target": e.target, "op": e.op, "content": e.content, "rationale": e.rationale}
             for e in result.applied_edits
