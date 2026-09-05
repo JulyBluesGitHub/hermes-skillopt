@@ -22,7 +22,6 @@ from contextlib import closing
 from dataclasses import dataclass, field
 from typing import Any, Dict, List
 
-from skillopt_sleep.backend import get_backend
 from skillopt_sleep.consolidate import consolidate
 from skillopt_sleep.mine import assign_splits
 from skillopt_sleep.types import TaskRecord
@@ -360,6 +359,8 @@ def run_hermes_sleep(
     edit_budget: int = 4,
     backend: str = "mock",
     dry_run: bool = False,
+    agent_path: str = "",
+    model: str = "",
 ) -> Dict[str, Any]:
     """Run one sleep cycle for a Hermes skill.
 
@@ -397,27 +398,47 @@ def run_hermes_sleep(
         return {"error": "skill_empty",
                 "message": f"Skill '{skill_name}' is empty at {live_skill_path}"}
 
-    # Get backend - use Hermes-specific backend for real failure analysis
-    if backend == "mock":
-        from hermes_skillopt.backend import HermesBackend
-        be = HermesBackend()
+    # Get backend. Real backends are wrapped so an empty response raises instead
+    # of silently scoring 0.0 — a dead CLI used to be indistinguishable from a
+    # candidate that genuinely didn't help.
+    from hermes_skillopt.llm_backend import BackendCallError, build_validating_backend
+
+    be = build_validating_backend(
+        backend, hermes_home=hermes_home, agent_path=agent_path, model=model,
+    )
+    if backend in ("mock", ""):
+        print("[hermes-sleep] WARNING: the mock backend derives scores from recorded "
+              "outcomes, not from the skill. It cannot show that an edit helps — "
+              "baseline and candidate will always match. Use --backend hermes to validate.",
+              file=sys.stderr)
     else:
-        be = get_backend(backend)
+        # One cheap round-trip: fail in seconds if the backend is dead, rather
+        # than after ~30 calls that all return nothing.
+        try:
+            probe = getattr(be, "probe", None)
+            if callable(probe):
+                probe()
+        except BackendCallError as exc:
+            return {"error": "backend_unavailable", "message": str(exc)}
 
     # Consolidate
     # With mock backend, scores can't change (outcome-derived), so use greedy mode.
-    # With real backends (claude/codex), the gate validates actual improvement.
+    # With real backends, the gate validates actual improvement.
     use_gate = backend not in ("mock", "") and not dry_run
-    result = consolidate(
-        be, tasks, current_skill, "",
-        edit_budget=edit_budget,
-        gate_metric="mixed",
-        gate_mixed_weight=0.5,
-        gate_mode="on" if use_gate else "off",
-        evolve_skill=True,
-        evolve_memory=False,
-        night=1,
-    )
+    try:
+        result = consolidate(
+            be, tasks, current_skill, "",
+            edit_budget=edit_budget,
+            gate_metric="mixed",
+            gate_mixed_weight=0.5,
+            gate_mode="on" if use_gate else "off",
+            evolve_skill=True,
+            evolve_memory=False,
+            night=1,
+        )
+    except BackendCallError as exc:
+        # Nothing is staged: a partial replay cannot support a proposal.
+        return {"error": "replay_failed", "message": str(exc)}
 
     # Build report
     n_train = sum(1 for t in tasks if t.split == "train")
@@ -473,7 +494,12 @@ def main():
         p.add_argument("--max-sessions", type=int, default=15)
         p.add_argument("--max-tasks", type=int, default=30)
         p.add_argument("--edit-budget", type=int, default=4, help="Max edits per night (learning rate)")
-        p.add_argument("--backend", default="mock", choices=["mock", "claude", "codex"])
+        p.add_argument("--backend", default="mock", choices=["mock", "hermes", "claude", "codex"],
+                       help="mock = offline heuristics (cannot validate); hermes = replay via "
+                            "Hermes's configured providers")
+        p.add_argument("--model", default="", help="Override the replay model")
+        p.add_argument("--hermes-agent-path", default="",
+                       help="hermes-agent checkout providing agent.auxiliary_client")
         p.add_argument("--json", action="store_true", help="Machine-readable output")
 
     # status
@@ -502,6 +528,8 @@ def cmd_run(args) -> int:
         edit_budget=args.edit_budget,
         backend=args.backend,
         dry_run=dry,
+        agent_path=args.hermes_agent_path,
+        model=args.model,
     )
 
     if "error" in report:

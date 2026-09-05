@@ -145,15 +145,48 @@ Incomplete sessions are never mined.
 
 Free and deterministic. It mines failure patterns and proposes heuristics, but its outcome-derived replay score cannot prove that an edit improves real agent performance. Reports may therefore show a flat score with `greedy_flat`.
 
-Treat mock proposals as reviewable suggestions, not validated regressions fixes.
+Treat mock proposals as reviewable suggestions, not validated regression fixes. The
+CLI warns on every mock run for this reason.
+
+### `hermes` (recommended)
+
+Replays each task through Hermes's own configured providers, with the candidate
+skill in the prompt, so the gate scores a real difference in model behaviour.
+Credentials come from `<hermes-home>/.env`, which this backend loads the way
+Hermes's own entrypoints do.
+
+```bash
+hermes-skillopt --backend hermes --skill my-skill
+hermes-skillopt --backend hermes --model deepseek-v4-flash --skill my-skill
+```
+
+The provider and model are pinned (`SKILLOPT_HERMES_PROVIDER`,
+`SKILLOPT_HERMES_MODEL`, or `--model`) rather than left to Hermes's routing: an
+unpinned auxiliary call can fall through to a provider with a credit fault and
+return empty content. `--hermes-agent-path` (or `HERMES_AGENT_PATH`) points at
+the hermes-agent checkout when it is not under the Hermes home.
 
 ### `claude` and `codex`
 
-These names are passed to the upstream SkillOpt backend registry. Availability depends on the installed SkillOpt version and local backend credentials. They are experimental in this Hermes adapter.
+Passed to the upstream SkillOpt backend registry; both shell out to an external
+CLI and depend on that CLI being installed, authenticated, and fast enough to
+answer inside the per-call timeout.
 
 ```bash
 hermes-skillopt --backend claude --skill my-skill
 ```
+
+### Failures are loud
+
+Real backends are wrapped so an empty or unparseable result raises instead of
+scoring `0.0`. This matters more than it sounds: upstream's CLI backend returns
+`""` on *any* failure and never checks the exit code, so an unauthenticated CLI
+used to produce a full run of zeros, exit `0`, and a staged report — identical
+in shape to a candidate that genuinely did not help.
+
+Each real run now starts with one cheap probe, so a dead backend fails in
+seconds instead of after every task, and a run with any failed replay stages
+nothing.
 
 ## Development
 
@@ -178,7 +211,7 @@ CI runs lint and tests on Python 3.10, 3.11, and 3.12.
 
 - Outcome labels are inferred from transcripts; explicit human quality labels are not yet stored by Hermes.
 - Skill attribution is session/turn based and depends on successful `skill_view` tool results.
-- The default mock backend cannot demonstrate score lift.
+- The default mock backend cannot demonstrate score lift; use `--backend hermes` to validate.
 - Staging directories created before v0.2.0 lack safety hashes and are refused; regenerate them.
 
 ## License
