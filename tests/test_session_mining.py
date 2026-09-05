@@ -144,7 +144,10 @@ def test_mining_for_skill_excludes_sessions_that_did_not_load_it(tmp_path):
 
     tasks = mine_hermes_tasks(sessions, skill_name="target-skill")
 
-    assert [task.intent for task in tasks] == ["[test-model] Matching task"]
+    # The intent is the request itself: the model name is noise to a judge and
+    # already travels in tags.
+    assert [task.intent for task in tasks] == ["Matching task"]
+    assert "test-model" in tasks[0].tags
     assert tasks[0].attempted_solution == "Matching response"
 
 

@@ -287,6 +287,42 @@ def _build_session(conn: sqlite3.Connection, row: sqlite3.Row) -> HermesSession:
 
 # ── Stage 2: Mine Tasks from Hermes Sessions ─────────────────────────────────
 
+#: The user's request is the task; 200 chars routinely cut mid-sentence.
+_INTENT_CHARS = 300
+#: Rubrics are read by a judge, so they can afford the whole request.
+_RUBRIC_CHARS = 800
+
+
+def build_task_rubric(record: "PromptRecord") -> str:
+    """Compose what a good answer to this turn must do.
+
+    Without a rubric the judge has nothing to discriminate on: the mock judge
+    falls back to ``1.0 if outcome == "success"``, which is fixed history and
+    ignores the response entirely, and the LLM judge is handed a truncated
+    prompt with the model name glued to the front.
+
+    Requirements are derived from what actually happened in the turn, not
+    boilerplate. The original response is deliberately NOT used as a reference —
+    scoring similarity to history would reward reproducing the old answer,
+    including when the old answer was the problem.
+    """
+    lines = [
+        "The user asked:",
+        record.prompt[:_RUBRIC_CHARS].strip(),
+        "",
+        "A good response must:",
+        "- directly and completely address that request",
+        "- state its actual findings, not a description of how it would proceed",
+    ]
+    if record.tool_errors:
+        lines.append(
+            "- report any step that fails, with the error, instead of presenting "
+            "a result as though it had succeeded"
+        )
+    if record.outcome == "fail":
+        lines.append("- produce a real answer; this request previously went unanswered")
+    return "\n".join(lines)
+
 def mine_hermes_tasks(
     sessions: List[HermesSession],
     skill_name: str = "",
@@ -314,14 +350,14 @@ def mine_hermes_tasks(
             task = TaskRecord(
                 id=f"hermes-{task_id}",
                 project=session.cwd,
-                intent=f"[{session.model}] {record.prompt[:200]}",
+                intent=record.prompt[:_INTENT_CHARS],
                 context_excerpt=f"Session: {session.title or session.session_id[:12]}\n"
                                f"Model: {session.model}\n"
                                f"Skills loaded: {', '.join(record.skills_loaded[:5])}",
                 attempted_solution=record.response[:500],
                 outcome=record.outcome,
-                reference_kind="none",
-                reference="",
+                reference_kind="rubric",
+                reference=build_task_rubric(record),
                 judge={},
                 tags=["hermes", session.model or "unknown"] +
                      ([skill_name] if skill_name else []),
