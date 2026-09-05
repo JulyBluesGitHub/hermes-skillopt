@@ -1,103 +1,160 @@
 # Hermes SkillOpt
 
-**On-demand skill optimization for AI coding agents.** Analyzes your agent's session history to find failure patterns and propose targeted improvements to skill files — backed by Microsoft's [SkillOpt](https://github.com/microsoft/SkillOpt) framework.
+On-demand skill optimization for Hermes Agent, backed by Microsoft's [SkillOpt](https://github.com/microsoft/SkillOpt) engine.
 
-> Built for Hermes Agent. Ports to Claude Code and Codex are straightforward (SkillOpt already has plugins for both).
+Hermes SkillOpt reads completed Hermes sessions, identifies the skills that were actually loaded through `skill_view`, mines task outcomes, and stages bounded additions to each skill's managed `LEARNED` block.
 
-## What it does
+## Why this adapter exists
 
-1. **Harvests** your recent agent sessions (from SQLite DB)
-2. **Mines** every task for success/failure patterns
-3. **Reflects** on failures and proposes bounded, targeted edits
-4. **Gates** edits against a held-out validation set
-5. **Stages** improvements in a LEARNED block at the bottom of your skill files
+SkillOpt already provides the optimization loop. This repository supplies the Hermes-specific seams:
 
-Your hand-written skill content is never touched. Improvements accumulate in a marked `<!-- SKILLOPT-SLEEP:LEARNED -->` section.
+- reads Hermes's SQLite session history;
+- associates user turns with final assistant responses and tool failures;
+- attributes tasks only to skills actually loaded in that session;
+- stages proposed `SKILL.md` updates outside the live skills directory;
+- verifies file hashes before adoption and creates a backup.
+
+It is intentionally on-demand. It does not install a daemon or cron job.
 
 ## Install
 
-```bash
-# Requires Python 3.10+ and the SkillOpt package
-pip install skillopt
+Requires Python 3.10+ and a local Hermes installation with session history.
 
-# Clone this repo
+```bash
 git clone https://github.com/JulyBluesGitHub/hermes-skillopt.git
 cd hermes-skillopt
+python -m pip install -e ".[dev]"
 ```
+
+The upstream `skillopt` package is installed as a dependency.
 
 ## Usage
 
-### One command (recommended)
-```bash
-python -m hermes_skillopt.run_nightly --run-and-adopt
-```
-This analyzes all recently-used skills and applies improvements in one shot.
+### Inspect available history
 
-### Step by step
 ```bash
-# See what's available
+hermes-skillopt-status status
+# or
 python -m hermes_skillopt.sleep status
-
-# Dry-run: preview proposed edits
-python -m hermes_skillopt.run_nightly --dry-run
-
-# Run for a specific skill
-python -m hermes_skillopt.run_nightly --skill my-skill-name
-
-# See staged improvements
-python -m hermes_skillopt.run_nightly --list-staged
-
-# Adopt everything
-python -m hermes_skillopt.run_nightly --adopt-all
 ```
 
-### Alias (optional)
-```bash
-alias skillopt="cd ~/hermes-skillopt && python -m hermes_skillopt.run_nightly --run-and-adopt"
-```
-
-## How it works
-
-```
-Your agent sessions (SQLite DB)
-  → harvest: extract every task with success/fail labels
-  → mine: group recurring patterns, split train/val
-  → reflect: analyze failures, propose bounded edits
-  → gate: validate against held-out set
-  → stage: append improvements to SKILL.md LEARNED block
-```
-
-Every adoption creates a backup. Every edit has a rationale (e.g., "67% of tasks fail from missing verification — added Self-Verification directive").
-
-## Porting to Claude Code / Codex
-
-This plugin is built on SkillOpt's engine. SkillOpt already ships plugins for Claude Code and Codex:
-
-- **Claude Code:** `/plugin marketplace add ./skillopt-sleep-plugin && /sleep`
-- **Codex:** `bash plugins/codex/install.sh && /sleep`
-
-See [Microsoft SkillOpt](https://github.com/microsoft/SkillOpt) for the upstream.
-
-The value-add of this repo is the Hermes session harvester — it reads from Hermes's SQLite session DB. For Claude/Codex, the upstream SkillOpt-Sleep plugins already do the equivalent from `~/.claude/` transcripts.
-
-## Files
-
-| File | Purpose |
-|------|---------|
-| `hermes_skillopt/run_nightly.py` | Main CLI: run, stage, adopt |
-| `hermes_skillopt/sleep.py` | Session harvester + task miner |
-| `hermes_skillopt/backend.py` | Failure pattern analyzer |
-
-## Backends
-
-- **mock** (default): Pattern analysis from session history. Free, fast, no API calls.
-- **claude**: Re-run tasks through Claude to validate real score improvement. Needs `claude` CLI and API key.
-- **codex**: Re-run tasks through Codex. Needs Codex CLI and API key.
+### Preview changes
 
 ```bash
-python -m hermes_skillopt.run_nightly --backend claude --skill my-skill
+hermes-skillopt --dry-run --skill daily-ai-news-digest
 ```
+
+Dry-run does not write staging files or modify live skills.
+
+### Stage changes for review
+
+```bash
+hermes-skillopt --skill daily-ai-news-digest
+hermes-skillopt --list-staged
+```
+
+### Adopt a reviewed proposal
+
+```bash
+hermes-skillopt --adopt daily-ai-news-digest
+```
+
+### One-shot run and adoption
+
+```bash
+hermes-skillopt --run-and-adopt
+```
+
+`--run-and-adopt` adopts only proposals created by that invocation. It does not sweep up older staged proposals.
+
+## Safety model
+
+Every proposal is written under:
+
+```text
+%LOCALAPPDATA%/hermes/skillopt-staging/<timestamp>-<skill>/
+```
+
+A staging directory contains:
+
+- `report.json` and `report.md`;
+- `proposed_SKILL.md`;
+- `manifest.json` with hashes of the live and proposed files;
+- `backup/` after adoption.
+
+Adoption fails closed when:
+
+- the manifest's skill name does not match the requested skill;
+- the proposal was already adopted;
+- the live skill changed after staging;
+- the proposed file changed after staging;
+- a legacy manifest lacks safety hashes.
+
+Edits are confined to the managed block:
+
+```markdown
+<!-- SKILLOPT-SLEEP:LEARNED START -->
+...
+<!-- SKILLOPT-SLEEP:LEARNED END -->
+```
+
+Hand-written content outside this block is preserved by SkillOpt's edit applicator.
+
+## Outcome labels
+
+Hermes SkillOpt uses conservative weak labels:
+
+- `success`: a completed turn produced a final assistant response without a detected tool failure;
+- `mixed`: a completed turn recovered from one or more detected tool failures and still produced a final response;
+- `fail`: a completed turn had a detected failure and no final response;
+- `unknown`: no reliable outcome evidence.
+
+Structured tool results are parsed. A successful payload containing `"error": null` is not treated as a failure.
+
+Incomplete sessions are never mined.
+
+## Backends and validation
+
+### `mock` (default)
+
+Free and deterministic. It mines failure patterns and proposes heuristics, but its outcome-derived replay score cannot prove that an edit improves real agent performance. Reports may therefore show a flat score with `greedy_flat`.
+
+Treat mock proposals as reviewable suggestions, not validated regressions fixes.
+
+### `claude` and `codex`
+
+These names are passed to the upstream SkillOpt backend registry. Availability depends on the installed SkillOpt version and local backend credentials. They are experimental in this Hermes adapter.
+
+```bash
+hermes-skillopt --backend claude --skill my-skill
+```
+
+## Development
+
+```bash
+python -m pip install -e ".[dev]"
+ruff check .
+python -m pytest -q
+```
+
+CI runs lint and tests on Python 3.10, 3.11, and 3.12.
+
+## Project layout
+
+| Path | Purpose |
+|---|---|
+| `hermes_skillopt/sleep.py` | Session harvesting, skill attribution, task mining |
+| `hermes_skillopt/backend.py` | Hermes-specific pattern reflection |
+| `hermes_skillopt/run_nightly.py` | On-demand staging and safe adoption CLI |
+| `tests/` | Session-mining and adoption regression tests |
+
+## Known limitations
+
+- Outcome labels are inferred from transcripts; explicit human quality labels are not yet stored by Hermes.
+- Skill attribution is session/turn based and depends on successful `skill_view` tool results.
+- The default mock backend cannot demonstrate score lift.
+- Existing staging directories created before v0.2.0 lack hashes and must be regenerated before adoption.
 
 ## License
 
-MIT — same as upstream SkillOpt.
+MIT. See [LICENSE](LICENSE). Microsoft SkillOpt remains governed by its own upstream license.
