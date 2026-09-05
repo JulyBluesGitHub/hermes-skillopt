@@ -287,9 +287,13 @@ the rubric.
 Judge ONLY against the rubric. Ignore style preferences it does not ask for.
 - Length is not quality. A longer answer is not better; a shorter one is not \
 better. Only rubric coverage counts.
-- An answer that declines, defers, or describes what it *would* do LOSES to one \
-that actually answers, however imperfectly.
-- An answer that is confidently wrong LOSES to one that is correct and hedged.
+- An answer that describes what it *would* do, in place of doing it, LOSES to \
+one that actually answers, however imperfectly.
+- Reporting that the request cannot be settled from what is available, and what \
+would settle it, is an answer, not a deferral.
+- An answer that is confidently wrong LOSES to one that is correct and hedged. \
+An assertion with nothing behind it does not beat a supported one by sounding \
+surer.
 - Choose "tie" only when you genuinely cannot separate them, not to avoid a call.
 
 Return ONLY JSON {"winner": "A"|"B"|"tie", "reason": "<one sentence>"}.

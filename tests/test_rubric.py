@@ -24,6 +24,31 @@ def test_rubric_carries_the_request():
     assert "A good response must:" in rubric
 
 
+def test_rubric_requires_a_claim_to_rest_on_something():
+    """The defect these two lines close: nothing required an answer to be right.
+
+    Asked "can we push?", a wrong four-character "Yes." beat a baseline that
+    correctly reported it could not verify that from the session — in both
+    judges, in both orders. "Yes." satisfied "directly address the request" and
+    the honest answer read as the hedging the findings requirement penalizes.
+    """
+    rubric = build_task_rubric(_record("can we push?"))
+    assert "rest each claim on something it can point to" in rubric
+    assert "cannot be settled from what it has" in rubric
+
+
+def test_reporting_a_limit_is_not_penalized_as_a_plan():
+    """The findings requirement names plans, not every answer that stops short.
+
+    "not a description of how it would proceed" also caught "I checked and this
+    session cannot tell me" — a finding, phrased as a limit. Naming the target
+    is what lets both requirements hold at once.
+    """
+    rubric = build_task_rubric(_record())
+    assert "not a plan for how it would arrive at them" in rubric
+    assert "how it would proceed" not in rubric
+
+
 def test_tool_failure_adds_an_honesty_requirement():
     clean = build_task_rubric(_record(response="done"))
     failed = build_task_rubric(_record(response="done", tool_errors=["shell: boom"]))

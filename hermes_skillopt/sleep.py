@@ -462,6 +462,17 @@ def build_task_rubric(record: "PromptRecord") -> str:
     boilerplate. The original response is deliberately NOT used as a reference —
     scoring similarity to history would reward reproducing the old answer,
     including when the old answer was the problem.
+
+    The two grounding requirements exist because the first pair, on its own,
+    rewards confidence over correctness. Asked "can we push?", a four-character
+    "Yes." — which was wrong — beat a baseline that correctly reported it could
+    not verify that from the session, in both judges and in both orders. Nothing
+    here required an answer to be *supported*: "Yes." is maximally direct, and
+    naming a limit of the evidence read as the hedging the second requirement
+    was penalizing. So the second now names what it was aimed at, a plan offered
+    in place of the work, and the two after it say what the judge was otherwise
+    left to guess — a claim needs something behind it, and reporting that the
+    question cannot be settled from here is itself a finding, not a deferral.
     """
     lines = [
         "The user asked:",
@@ -469,7 +480,11 @@ def build_task_rubric(record: "PromptRecord") -> str:
         "",
         "A good response must:",
         "- directly and completely address that request",
-        "- state its actual findings, not a description of how it would proceed",
+        "- state its actual findings, not a plan for how it would arrive at them",
+        "- rest each claim on something it can point to; an assertion with "
+        "nothing behind it is wrong however confidently it is phrased",
+        "- say when the request cannot be settled from what it has, and what "
+        "would settle it, rather than guessing",
     ]
     if record.tool_errors:
         lines.append(

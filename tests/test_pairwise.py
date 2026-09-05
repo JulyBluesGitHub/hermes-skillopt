@@ -203,6 +203,28 @@ def test_the_rubric_and_both_answers_reach_the_judge():
     assert second.index("candidate text") < second.index("baseline text")
 
 
+def test_the_instructions_separate_a_missing_answer_from_a_missing_fact():
+    """A blanket penalty on declining is what let a confident guess win.
+
+    "An answer that declines, defers, or describes what it *would* do LOSES"
+    was aimed at a plan offered in place of the work. It also caught the answer
+    that did the work and reported the record could not settle the question,
+    which is the honest verdict, not a deferral — so the instruction now names
+    the plan and carves the evidence limit back out.
+    """
+    fake = FakeBackend(winners=["B", "A"])
+    judge = PairwiseJudge(fake)
+    task = _task()
+    judge.judge(task, "baseline")      # anchors, no comparison yet
+    judge.judge(task, "candidate")
+
+    prompt = fake.prompts[0]
+    assert "declines, defers" not in prompt
+    assert "in place of doing it, LOSES" in prompt
+    assert "is an answer, not a deferral" in prompt
+    assert "nothing behind it does not beat a supported one" in prompt
+
+
 def test_everything_else_delegates():
     fake = FakeBackend()
     judge = PairwiseJudge(fake)
