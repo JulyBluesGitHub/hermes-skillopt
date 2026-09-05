@@ -89,3 +89,23 @@ def test_adopt_staging_dirs_only_adopts_the_new_run(tmp_path):
     assert old_live.read_text(encoding="utf-8") == "old original"
     assert new_live.read_text(encoding="utf-8") == "new proposal"
     assert old_dir.exists()
+
+
+def test_list_staged_reads_utf8_reports(tmp_path, monkeypatch, capsys):
+    """Reports are written UTF-8; reading them with the platform default encoding
+    mangles them (or raises) on Windows consoles."""
+    import hermes_skillopt.run_nightly as runner
+
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    live = tmp_path / "skill.md"
+    live.write_text("old", encoding="utf-8")
+    _stage(staging, "unicode-skill", live, "proposed → better")
+
+    monkeypatch.setattr(runner, "STAGING_ROOT", str(staging))
+    runner.cmd_list_staged(object())
+
+    out = capsys.readouterr().out
+    assert "unicode-skill" in out
+    assert "→" in out          # the arrow survived the round-trip
+    assert "Ã" not in out and "â" not in out   # ...and was not mojibake

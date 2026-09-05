@@ -67,6 +67,24 @@ hermes-skillopt --run-and-adopt
 
 `--run-and-adopt` adopts only proposals created by that invocation. It does not sweep up older staged proposals.
 
+## Locating skills
+
+Skills resolve from `<hermes-home>/skills` by default, where `<hermes-home>` is
+`$HERMES_HOME`, else the platform default. Override either level:
+
+```bash
+hermes-skillopt --skill my-skill --hermes-home /srv/hermes
+hermes-skillopt --skill my-skill --skills-dir /srv/hermes/skills
+```
+
+Both the nested `<category>/<skill>/SKILL.md` and flat `<skill>/SKILL.md`
+layouts resolve, plus a bare `<skill>.md` as a last resort.
+
+If a name matches more than one file — a real possibility, since two categories
+can each hold a skill of the same name — the run fails with `AmbiguousSkillError`
+rather than editing whichever the filesystem happened to return first. Pass
+`--skills-dir` to point at the one you mean.
+
 ## Safety model
 
 Every proposal is written under:
@@ -99,6 +117,14 @@ Edits are confined to the managed block:
 ```
 
 Hand-written content outside this block is preserved by SkillOpt's edit applicator.
+
+The path a proposal is staged against is the exact path the optimizer read, and
+it travels in the report rather than being re-derived at staging time. Resolving
+it twice is what allows a proposal built from one file to be adopted onto
+another while both hashes still verify.
+
+Session history is opened through a read-only SQLite connection, so a bug in
+this tool cannot mutate Hermes's `state.db`.
 
 ## Outcome labels
 
@@ -153,7 +179,7 @@ CI runs lint and tests on Python 3.10, 3.11, and 3.12.
 - Outcome labels are inferred from transcripts; explicit human quality labels are not yet stored by Hermes.
 - Skill attribution is session/turn based and depends on successful `skill_view` tool results.
 - The default mock backend cannot demonstrate score lift.
-- Existing staging directories created before v0.2.0 lack hashes and must be regenerated before adoption.
+- Staging directories created before v0.2.0 lack safety hashes and are refused; regenerate them.
 
 ## License
 

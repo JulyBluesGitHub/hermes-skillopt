@@ -17,6 +17,8 @@ import json
 import os
 import sqlite3
 import sys
+import time
+from contextlib import closing
 from dataclasses import dataclass, field
 from typing import Any, Dict, List
 
@@ -41,6 +43,79 @@ def _resolve_hermes_home() -> str:
         if candidate and os.path.isdir(candidate):
             return candidate
     return DEFAULT_HERMES_HOME
+
+
+class AmbiguousSkillError(RuntimeError):
+    """A skill name resolves to more than one SKILL.md."""
+
+
+def enable_utf8_output() -> None:
+    """Make the CLI's status glyphs printable on legacy consoles.
+
+    Windows terminals default to cp1252, where printing '✓' raises
+    UnicodeEncodeError and takes the whole command down.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):  # detached or already-wrapped stream
+            pass
+
+
+def connect_readonly(db_path: str) -> sqlite3.Connection:
+    """Open Hermes's live state DB read-only.
+
+    This tool runs against a database a live agent may be writing. A read-only
+    URI connection means a bug here can never mutate session history, and it
+    keeps the reader out of the way of the writer.
+    """
+    uri = "file:" + os.path.abspath(db_path).replace("?", "%3f").replace("#", "%23") + "?mode=ro"
+    conn = sqlite3.connect(uri, uri=True)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def resolve_skills_dir(skills_dir: str = "", hermes_home: str = "") -> str:
+    """Skills directory: explicit override, else ``<resolved hermes home>/skills``.
+
+    Derived from the resolved home rather than a frozen constant so ``HERMES_HOME``
+    and ``--hermes-home`` are honored on every platform, not just the Windows default.
+    """
+    if skills_dir:
+        return skills_dir
+    return os.path.join(hermes_home or _resolve_hermes_home(), "skills")
+
+
+def find_skill_path(skill_name: str, skills_dir: str = "", hermes_home: str = "") -> str:
+    """Absolute path of ``skill_name``'s markdown file, or "" when it does not exist.
+
+    Single source of truth for skill location. The optimizer (which *reads* the
+    skill) and the stager (which records the adoption target and its hash) must
+    agree on one path: if they resolve differently, a proposal derived from file
+    A can be adopted onto file B while the safety hashes still verify, because
+    each was computed against a different file.
+
+    ``**`` already matches zero directories, so the nested-category glob covers
+    the flat ``<skills_dir>/<name>/SKILL.md`` layout too; the bare ``<name>.md``
+    file is the only separate fallback.
+    """
+    import glob
+
+    base = resolve_skills_dir(skills_dir, hermes_home)
+    matches = sorted(set(glob.glob(os.path.join(base, "**", skill_name, "SKILL.md"), recursive=True)))
+    if len(matches) > 1:
+        raise AmbiguousSkillError(
+            f"Skill '{skill_name}' matches {len(matches)} files under {base}: "
+            + ", ".join(matches)
+            + ". Pass --skills-dir to disambiguate; refusing to guess which one to edit."
+        )
+    if matches:
+        return matches[0]
+    flat_file = os.path.join(base, f"{skill_name}.md")
+    return flat_file if os.path.isfile(flat_file) else ""
 
 
 # ── Stage 1: Harvest Hermes Sessions ─────────────────────────────────────────
@@ -134,88 +209,81 @@ def harvest_hermes_sessions(
         print(f"[hermes-sleep] No Hermes DB found at {db_path}")
         return []
 
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-
-    # Get recent sessions
-    import time
     cutoff = time.time() - (lookback_hours * 3600)
+    with closing(connect_readonly(db_path)) as conn:
+        rows = conn.execute("""
+            SELECT id, title, cwd, model, started_at, ended_at,
+                   message_count, tool_call_count
+            FROM sessions
+            WHERE started_at > ? AND archived = 0
+            ORDER BY started_at DESC
+            LIMIT ?
+        """, (cutoff, max_sessions)).fetchall()
+        return [_build_session(conn, row) for row in rows]
 
-    rows = conn.execute("""
-        SELECT id, title, cwd, model, started_at, ended_at,
-               message_count, tool_call_count
-        FROM sessions
-        WHERE started_at > ? AND archived = 0
-        ORDER BY started_at DESC
-        LIMIT ?
-    """, (cutoff, max_sessions)).fetchall()
 
-    sessions = []
-    for row in rows:
-        s = HermesSession(
-            session_id=row["id"],
-            title=row["title"] or "",
-            cwd=row["cwd"] or "",
-            model=row["model"] or "",
-            started_at=row["started_at"],
-            ended_at=row["ended_at"] or row["started_at"],
-            completed=row["ended_at"] is not None,
-            message_count=row["message_count"],
-            tool_call_count=row["tool_call_count"],
-        )
+def _build_session(conn: sqlite3.Connection, row: sqlite3.Row) -> HermesSession:
+    """Assemble one session and its per-turn outcome records from the message log."""
+    s = HermesSession(
+        session_id=row["id"],
+        title=row["title"] or "",
+        cwd=row["cwd"] or "",
+        model=row["model"] or "",
+        started_at=row["started_at"],
+        ended_at=row["ended_at"] or row["started_at"],
+        completed=row["ended_at"] is not None,
+        message_count=row["message_count"],
+        tool_call_count=row["tool_call_count"],
+    )
 
-        # Get messages for this session (user + assistant + tool, in order)
-        msgs = conn.execute("""
-            SELECT role, content, tool_name, timestamp
-            FROM messages
-            WHERE session_id = ? AND active = 1
-            ORDER BY id
-        """, (s.session_id,)).fetchall()
+    # Messages for this session (user + assistant + tool, in order)
+    msgs = conn.execute("""
+        SELECT role, content, tool_name, timestamp
+        FROM messages
+        WHERE session_id = ? AND active = 1
+        ORDER BY id
+    """, (s.session_id,)).fetchall()
 
-        current: PromptRecord | None = None
-        active_skills: List[str] = []
+    current: PromptRecord | None = None
+    active_skills: List[str] = []
 
-        for msg in msgs:
-            role = msg["role"]
-            content = msg["content"] or ""
-            if role == "user" and content.strip():
+    for msg in msgs:
+        role = msg["role"]
+        content = msg["content"] or ""
+        if role == "user" and content.strip():
+            if current is not None:
+                _finish_prompt(current)
+                s.prompt_records.append(current)
+            current = PromptRecord(
+                prompt=content.strip(),
+                skills_loaded=list(active_skills),
+            )
+        elif role == "assistant" and content.strip():
+            if current is not None:
+                current.response = content.strip()[:1000]
+            s.assistant_responses.append(content[:1000])
+        elif role == "tool" and msg["tool_name"]:
+            tool_name = msg["tool_name"]
+            if tool_name == "skill_view":
+                skill_name = _skill_name_from_result(content)
+                if skill_name and skill_name not in active_skills:
+                    active_skills.append(skill_name)
+                if current is not None and skill_name and skill_name not in current.skills_loaded:
+                    current.skills_loaded.append(skill_name)
+                if skill_name and skill_name not in s.skills_loaded:
+                    s.skills_loaded.append(skill_name)
+            if _tool_result_failed(content):
+                error = f"{tool_name}: {content[:300]}"
+                s.tool_errors.append(error)
                 if current is not None:
-                    _finish_prompt(current)
-                    s.prompt_records.append(current)
-                current = PromptRecord(
-                    prompt=content.strip(),
-                    skills_loaded=list(active_skills),
-                )
-            elif role == "assistant" and content.strip():
-                if current is not None:
-                    current.response = content.strip()[:1000]
-                s.assistant_responses.append(content[:1000])
-            elif role == "tool" and msg["tool_name"]:
-                tool_name = msg["tool_name"]
-                if tool_name == "skill_view":
-                    skill_name = _skill_name_from_result(content)
-                    if skill_name and skill_name not in active_skills:
-                        active_skills.append(skill_name)
-                    if current is not None and skill_name and skill_name not in current.skills_loaded:
-                        current.skills_loaded.append(skill_name)
-                    if skill_name and skill_name not in s.skills_loaded:
-                        s.skills_loaded.append(skill_name)
-                if _tool_result_failed(content):
-                    error = f"{tool_name}: {content[:300]}"
-                    s.tool_errors.append(error)
-                    if current is not None:
-                        current.tool_errors.append(error)
+                    current.tool_errors.append(error)
 
-        if current is not None:
-            _finish_prompt(current)
-            s.prompt_records.append(current)
+    if current is not None:
+        _finish_prompt(current)
+        s.prompt_records.append(current)
 
-        s.user_prompts = [record.prompt[:500] for record in s.prompt_records]
-
-        sessions.append(s)
-
-    conn.close()
-    return sessions
+    s.user_prompts = [record.prompt[:500] for record in s.prompt_records]
+    return s
 
 
 # ── Stage 2: Mine Tasks from Hermes Sessions ─────────────────────────────────
@@ -273,31 +341,13 @@ def mine_hermes_tasks(
 
 # ── Stage 3+4: Load skill and run consolidate ────────────────────────────────
 
-def load_hermes_skill(skill_name: str, skills_dir: str = "") -> str:
-    """Load a Hermes skill .md file. Searches recursively for category/skill/SKILL.md."""
-    import glob
-    skills_dir = skills_dir or DEFAULT_SKILLS_DIR
-
-    # Search for the skill in nested category folders
-    pattern = os.path.join(skills_dir, "**", skill_name, "SKILL.md")
-    matches = glob.glob(pattern, recursive=True)
-    if matches:
-        with open(matches[0], encoding="utf-8") as f:
-            return f.read()
-
-    # Try flat: skills_dir/skill_name/SKILL.md
-    skill_path = os.path.join(skills_dir, skill_name, "SKILL.md")
-    if os.path.exists(skill_path):
-        with open(skill_path, encoding="utf-8") as f:
-            return f.read()
-
-    # Try flat file
-    skill_path = os.path.join(skills_dir, f"{skill_name}.md")
-    if os.path.exists(skill_path):
-        with open(skill_path, encoding="utf-8") as f:
-            return f.read()
-
-    return ""
+def load_hermes_skill(skill_name: str, skills_dir: str = "", hermes_home: str = "") -> str:
+    """Load a Hermes skill .md file, or "" when it does not exist."""
+    path = find_skill_path(skill_name, skills_dir=skills_dir, hermes_home=hermes_home)
+    if not path:
+        return ""
+    with open(path, encoding="utf-8") as f:
+        return f.read()
 
 
 def run_hermes_sleep(
@@ -334,11 +384,18 @@ def run_hermes_sleep(
     # Assign train/val splits
     tasks = assign_splits(tasks, holdout_fraction=0.30, seed=42)
 
-    # Load current skill
-    current_skill = load_hermes_skill(skill_name, skills_dir=skills_dir)
-    if not current_skill:
+    # Load current skill. The resolved path travels in the report so the stager
+    # records the hash of the very file that was optimized (never a re-resolved one).
+    resolved_dir = resolve_skills_dir(skills_dir, hermes_home)
+    live_skill_path = find_skill_path(skill_name, skills_dir=skills_dir, hermes_home=hermes_home)
+    if not live_skill_path:
         return {"error": "skill_not_found",
-                "message": f"Skill '{skill_name}' not found in {skills_dir}"}
+                "message": f"Skill '{skill_name}' not found in {resolved_dir}"}
+    with open(live_skill_path, encoding="utf-8") as handle:
+        current_skill = handle.read()
+    if not current_skill:
+        return {"error": "skill_empty",
+                "message": f"Skill '{skill_name}' is empty at {live_skill_path}"}
 
     # Get backend - use Hermes-specific backend for real failure analysis
     if backend == "mock":
@@ -368,6 +425,7 @@ def run_hermes_sleep(
 
     report = {
         "skill_name": skill_name,
+        "live_skill_path": live_skill_path,
         "n_sessions": len(sessions),
         "n_tasks": len(tasks),
         "n_train": n_train,
@@ -398,6 +456,7 @@ def run_hermes_sleep(
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 def main():
+    enable_utf8_output()
     parser = argparse.ArgumentParser(
         prog="hermes-sleep",
         description="On-demand SkillOpt-Sleep for Hermes Agent"

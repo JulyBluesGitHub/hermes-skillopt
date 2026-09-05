@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hermes-skillopt"
-version = "0.2.0"
+version = "0.3.0"
 description = "On-demand SkillOpt session mining and safe skill adoption for Hermes Agent"
 readme = "README.md"
 license = {text = "MIT"}
