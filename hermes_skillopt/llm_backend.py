@@ -24,7 +24,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
-from typing import Any, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 from skillopt_sleep.backend import CliBackend
 from skillopt_sleep.types import TaskRecord
@@ -269,6 +269,176 @@ class StrictBackend:
         return getattr(self._inner, item)
 
 
+# ── Pairwise judge ───────────────────────────────────────────────────────────
+
+_PAIRWISE_PROMPT = """\
+Two assistants answered the same request. Decide which answer better satisfies \
+the rubric.
+
+Judge ONLY against the rubric. Ignore style preferences it does not ask for.
+- Length is not quality. A longer answer is not better; a shorter one is not \
+better. Only rubric coverage counts.
+- An answer that declines, defers, or describes what it *would* do LOSES to one \
+that actually answers, however imperfectly.
+- An answer that is confidently wrong LOSES to one that is correct and hedged.
+- Choose "tie" only when you genuinely cannot separate them, not to avoid a call.
+
+Return ONLY JSON {"winner": "A"|"B"|"tie", "reason": "<one sentence>"}.
+"""
+
+
+def _pairwise_prompt(rubric: str, a: str, b: str) -> str:
+    """Assemble the comparison prompt by concatenation, never by interpolation.
+
+    Both answers are model output and routinely contain ``%`` and ``{}`` — a
+    percent-format or ``str.format`` template raises on the first "up 40%" in a
+    news digest, mid-run, after the attempts have already been paid for.
+    """
+    return "\n".join([
+        _PAIRWISE_PROMPT,
+        "# Rubric",
+        rubric or "(no rubric)",
+        "",
+        "# Answer A",
+        a,
+        "",
+        "# Answer B",
+        b,
+        "",
+    ])
+
+#: Win / tie / loss, returned as both hard and soft so every gate metric
+#: ("hard", "soft", "mixed") agrees and the baseline anchors at 0.5 under all
+#: three. Mixing an anchored score with an unanchored one would let a candidate
+#: clear the gate on the projection rather than on the comparison.
+_WIN, _TIE, _LOSS = 1.0, 0.5, 0.0
+
+
+class PairwiseJudge:
+    """Score each response by comparison with the baseline, not on an absolute scale.
+
+    Asking a model to rate one answer 0..1 is the harder question, and it answers
+    it badly: measured live, the absolute judge emitted only ``{0.0, 0.1, 0.9,
+    1.0}``, gave a four-character response 1.00, and separated a deliberately
+    *good* skill edit from baseline by exactly +0.000. Ranking two answers is the
+    easier question and the standard remedy for that binary collapse.
+
+    The comparison needs both responses at once, but ``Backend.judge`` sees one
+    at a time. It does not need a new signature: ``consolidate`` replays the
+    baseline slice before any candidate, so the first response seen for a task
+    *is* the baseline. This wrapper records it and compares every later response
+    against it.
+
+    That anchors the gate. A baseline scores ``0.5`` — tied with itself, by
+    definition — so ``cand_score > base_score`` stops meaning "two noisy absolute
+    means differ" and starts meaning "the candidate wins more head-to-heads than
+    it loses". Under the absolute judge that comparison was the weakest link;
+    here it is exact.
+
+    Position bias is the failure mode this introduces, and judges have a lot of
+    it. Every comparison is therefore run twice with the order swapped: the two
+    must agree, or the result is a tie. That doubles judge calls, which are the
+    cheap half of a replay (a judge prompt is capped at 200 tokens, an attempt at
+    512) and buys a verdict that is about the answers rather than their order.
+    """
+
+    def __init__(self, inner: Any, *, diagnose_baseline: bool = True) -> None:
+        self._inner = inner
+        self.name = f"{getattr(inner, 'name', 'backend')}+pairwise"
+        self.diagnose_baseline = diagnose_baseline
+        self._baseline: Dict[str, str] = {}
+        self._comparisons = 0
+
+    # -- judging -------------------------------------------------------------
+
+    def judge(self, task: TaskRecord, response: str) -> Tuple[float, float, str]:
+        rubric = (task.reference or task.intent or "").strip()
+
+        if task.id not in self._baseline:
+            self._baseline[task.id] = response
+            return (_TIE, _TIE, self._baseline_rationale(task, response))
+
+        baseline = self._baseline[task.id]
+        # Identical text cannot beat itself, and an edit that changed nothing is
+        # the common case when reflect proposes something the model ignores.
+        # Short-circuiting keeps that free instead of paying two calls to be told
+        # what string equality already established.
+        if response == baseline:
+            return (_TIE, _TIE, "identical to baseline")
+
+        first = self._compare(rubric, baseline, response)      # baseline=A
+        second = self._compare(rubric, response, baseline)     # candidate=A
+
+        # Verdicts are in A/B terms, so the swapped run has to be read inverted.
+        cand_won = first[0] == "B"
+        cand_won_swapped = second[0] == "A"
+        if cand_won and cand_won_swapped:
+            return (_WIN, _WIN, f"wins both orders: {first[1]}")
+        base_won = first[0] == "A"
+        base_won_swapped = second[0] == "B"
+        if base_won and base_won_swapped:
+            return (_LOSS, _LOSS, f"loses both orders: {first[1]}")
+        if first[0] == "tie" and second[0] == "tie":
+            return (_TIE, _TIE, f"tie both orders: {first[1]}")
+        return (_TIE, _TIE, f"order-dependent ({first[0]} then {second[0]}); scored a tie")
+
+    def _baseline_rationale(self, task: TaskRecord, response: str) -> str:
+        """One absolute judgement of the baseline, kept only as a why-wrong note.
+
+        ``reflect`` shows the optimizer each failing task's ``fail_reason``, and
+        every baseline is a 0.5, so without this every rule would be proposed
+        against a blank diagnosis. The absolute score itself is discarded — it is
+        the unreliable number this class exists to stop gating on — but its prose
+        still names what the answer missed, which is all reflect reads.
+        """
+        if not self.diagnose_baseline:
+            return "baseline (no comparison yet)"
+        try:
+            _hard, _soft, reason = self._inner.judge(task, response)
+        except Exception as exc:  # a diagnostic must never fail the run
+            logger.debug("Baseline diagnosis failed for %s: %s", task.id, exc)
+            return "baseline (no comparison yet)"
+        return f"baseline: {reason}".strip()
+
+    def _compare(self, rubric: str, a: str, b: str) -> Tuple[str, str]:
+        """One ordered comparison. Returns ``(winner, reason)`` with winner in A/B/tie."""
+        from skillopt_sleep.backend import _extract_json
+
+        prompt = _pairwise_prompt(rubric, a, b)
+        self._comparisons += 1
+        raw = self._call_judge(prompt)
+        obj = _extract_json(raw, "object")
+        winner = str((obj or {}).get("winner", "")).strip().upper()
+        if winner not in ("A", "B", "TIE"):
+            raise BackendCallError(
+                f"Pairwise judge returned {raw[:120]!r}, which names no winner. "
+                "Treating that as a tie would hide a broken judge behind a "
+                "plausible no-change result."
+            )
+        reason = str((obj or {}).get("reason", ""))[:160]
+        return ("tie" if winner == "TIE" else winner), reason
+
+    def _call_judge(self, prompt: str) -> str:
+        """Route through the inner cache when it has one, so re-scoring is free."""
+        from skillopt_sleep.backend import skill_hash
+
+        cached = getattr(self._inner, "_cached_call", None)
+        if callable(cached):
+            return cached("pairwise:" + skill_hash(prompt), prompt, max_tokens=200)
+        return self._inner._call(prompt, max_tokens=200)
+
+    # -- delegation ----------------------------------------------------------
+
+    def comparisons_made(self) -> int:
+        return self._comparisons
+
+    def __getattr__(self, item: str) -> Any:
+        # attempt, reflect, probe, tokens_used, attempt_with_tools, ...
+        return getattr(self._inner, item)
+
+
+# ── Factory ─────────────────────────────────────────────────────────────────
+
 def build_validating_backend(
     backend: str,
     *,
@@ -276,14 +446,26 @@ def build_validating_backend(
     agent_path: str = "",
     model: str = "",
     strict: bool = True,
+    judge_mode: str = "absolute",
 ) -> Any:
     """Construct a backend by name and wrap it so failures are loud.
 
     ``mock`` stays offline and unwrapped: it never calls out, and its scores are
     derived from recorded outcomes rather than from the skill, so it cannot show
     that an edit helped.
+
+    With ``judge_mode="pairwise"`` the strict backend is wrapped again so scores
+    come from head-to-head comparison against the baseline response rather than
+    from an absolute rating. The order matters: the pairwise judge delegates its
+    own calls inward, so the strict guard still sees every one of them.
     """
     if backend in ("mock", ""):
+        if judge_mode == "pairwise":
+            raise ValueError(
+                "The mock backend cannot judge pairwise: its scores come from "
+                "recorded outcomes, not from the responses, so both sides of a "
+                "comparison would score the same. Use --backend hermes."
+            )
         from hermes_skillopt.backend import HermesBackend
         return HermesBackend()
 
@@ -293,4 +475,9 @@ def build_validating_backend(
         from skillopt_sleep.backend import get_backend
         inner = get_backend(backend, model=model)
 
-    return StrictBackend(inner) if strict else inner
+    built = StrictBackend(inner) if strict else inner
+    if judge_mode == "pairwise":
+        return PairwiseJudge(built)
+    if judge_mode not in ("absolute", ""):
+        raise ValueError(f"unknown judge mode {judge_mode!r}; expected absolute/pairwise")
+    return built

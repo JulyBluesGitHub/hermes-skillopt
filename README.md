@@ -176,6 +176,52 @@ answer inside the per-call timeout.
 hermes-skillopt --backend claude --skill my-skill
 ```
 
+## Judging: absolute or pairwise
+
+### `absolute` (default)
+
+The judge rates each response against the task's rubric on a 0..1 scale, and the
+gate compares the mean of those ratings before and after an edit.
+
+Measured live on `daily-ai-news-digest`, that scale is not one. Across twelve
+calls the judge emitted only `{0.0, 0.1, 0.9, 1.0}`; it gave a **four-character
+response 1.00** while a 2,564-character substantive answer scored 0.00. Against
+a deliberately harmful skill edit it separated correctly (−0.225), but against a
+deliberately *helpful* one it separated by **+0.000**. It is a coarse switch, and
+it sometimes flips the wrong way — so it can veto a disaster but cannot approve
+an improvement.
+
+### `pairwise` (recommended for real runs)
+
+```bash
+hermes-skillopt --backend hermes --judge pairwise --skill my-skill
+```
+
+Instead of rating one answer, the judge is shown the baseline answer and the
+candidate answer to the same task and asked which better satisfies the rubric.
+Ranking two responses is a much easier question than scoring one, and it is the
+standard remedy for exactly this binary collapse.
+
+This also fixes what the gate means. A baseline scores `0.5` — tied with itself,
+by definition — so `candidate > baseline` stops being a comparison of two noisy
+absolute means and becomes "the candidate wins more head-to-heads than it loses".
+
+Every comparison runs **twice with the order swapped**. Judges have strong
+position bias, and a verdict that flips when the answers are exchanged is
+recorded as a tie rather than a win. That doubles judge calls — the cheap half of
+a replay, capped at 200 tokens against an attempt's 512 — and buys a verdict
+about the answers rather than their placement.
+
+Two shortcuts keep the cost down: a candidate whose text is identical to the
+baseline is scored a tie without any call, and the gate metric is forced to
+`soft` (a pairwise score is already the comparison the gate wants; blending it
+with a threshold bit would let a candidate pass on the projection instead of on
+the answers).
+
+`--judge pairwise` requires a real backend. The mock backend derives scores from
+recorded outcomes rather than from the responses, so both sides of a comparison
+would always tie; asking for it raises rather than silently doing nothing.
+
 ### Failures are loud
 
 Real backends are wrapped so an empty or unparseable result raises instead of
@@ -204,13 +250,16 @@ CI runs lint and tests on Python 3.10, 3.11, and 3.12.
 |---|---|
 | `hermes_skillopt/sleep.py` | Session harvesting, skill attribution, task mining |
 | `hermes_skillopt/backend.py` | Hermes-specific pattern reflection |
+| `hermes_skillopt/llm_backend.py` | Real replay transport, loud-failure guard, pairwise judge |
 | `hermes_skillopt/run_nightly.py` | On-demand staging and safe adoption CLI |
 | `tests/` | Session-mining and adoption regression tests |
 
 ## Known limitations
 
 - Outcome labels are inferred from transcripts; explicit human quality labels are not yet stored by Hermes.
-- Judge scores are coarse: a subtle edit can improve a response without moving the score.
+- The default absolute judge is coarse: a subtle edit can improve a response without
+  moving the score. Use `--judge pairwise` on real runs.
+- Pairwise scores are ordinal. A win rate says the candidate is better, not by how much.
 - Skill attribution is session/turn based and depends on successful `skill_view` tool results.
 - The default mock backend cannot demonstrate score lift; use `--backend hermes` to validate.
 - Staging directories created before v0.2.0 lack safety hashes and are refused; regenerate them.
