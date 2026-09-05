@@ -191,16 +191,37 @@ earlier turn had found. It now carries the conversation itself:
 Session: Daily AI news digest #3
 Skills loaded: daily-ai-news-digest, github, skillopt
 
-Earlier in this conversation:
+--- record of earlier turns in this conversation ---
 
 [user] can we push?
 [tool:terminal] {"output": "HEAD -> fix/safe-session-mining ... ", "exit_code": 0}
 [assistant] Already pushed and verified. Local HEAD matches the remote branch...
+
+--- end of record ---
 ```
+
+**The record is closed as well as opened.** An excerpt that simply stops is a
+transcript, and the likeliest continuation of a transcript is its next entry: a
+replay answered one task with a raw `read_file` tool call rather than an answer,
+for a file its own excerpt already quoted. The framing stays neutral about what
+to do with the record — instructing the model to answer regardless of what it can
+verify is the harness workaround the replayability filter exists to stop
+rewarding. Provider tool-call markup is stripped on the way in for the same
+reason, though it was never the cause: 1 of 692 excerpts carried any.
 
 Across the same 200 sessions, 744 of 777 mined tasks (95.8%) now carry real
 preceding turns; the remaining 4.2% are the first turn of their session, which
-had none. Excerpts run to a median of 1.8k characters and a p95 of 2.3k.
+had none.
+
+The three budgets — 1200 characters per message, 8000 per excerpt, 8 tool results
+per turn — were raised from 400/2000/4 after measuring how hard the originals
+bound: they cut 63.5% of captured tool results, dropped 71.3% of tool calls, and
+rendered 8.2% of available preceding turns. `read_file` is the second most-used
+tool in this history at 3501 calls, so the code a mined turn asks about was being
+read by an earlier turn and then discarded here. At the current budgets those
+read 37.3%, 54.6% and 13.8%, and the median excerpt is 6.8k characters rather
+than 1.8k. `_CONTEXT_MESSAGE_CHARS` also applies at harvest, so it is the
+constant that decides what is ever available to render.
 
 The budget is spent newest-turn-first and rendered oldest-first — when a
 conversation does not fit, the turns nearest the task are the ones its request
@@ -211,8 +232,8 @@ what replay is supposed to produce.
 means shell output and file contents now reach a model provider, which they did
 not when it held a session title. Credential-shaped substrings are blanked while
 the name that labelled them is kept, so the model still knows a key was there.
-Over real history this fired 64 times — mostly `read_file` on a config with
-`api_key:` in it — and left no credential-shaped string behind.
+Over real history this fires 265 times — mostly `read_file` on a config with
+`api_key:` in it — and leaves no credential-shaped string behind.
 
 This does not make an unreplayable turn replayable, and the tool filter still
 runs: a turn that needed to *run* something is still dropped.
@@ -227,27 +248,34 @@ re-samples every response on its own.
 |---|---|---|---|
 | before the tool filter | +0.375 | −0.125 | yes — but the run contained the `"Yes."` pathology |
 | after it, empty excerpt | −0.125 | −0.125 | no |
-| after it, filled excerpt | −0.250 | **−0.500** | no |
+| after it, filled excerpt, budgets 400/2000/4 | −0.250 | **−0.500** | no |
+| budgets 1200/8000/8 | −0.125 | −0.250 | no — and one baseline reply was a tool call |
+| ...with the record delimited | **+0.375** | **−0.500** | **yes** |
 
-**Half the gate now works.** The bad edit — ten-word answers, no reasoning —
-lost every task in both orders, where before it won one and tied another. A
-harmful edit can no longer clear the gate by being confidently terse, because
-the baseline it is compared against now has something real to say: every
-baseline answer cites facts from the conversation, and none of them open by
-declining. The absolute judge spreads over five distinct values rather than
-clustering, for the same reason.
+**The gate ranks all three arms correctly, on the last row.** The helpful edit
+wins three tasks in both orders and ties the fourth; the harmful edit — ten-word
+answers, no reasoning — loses all four in both orders. Both directions hold at
+once for the first time.
 
-**Certifying a helpful edit still does not work.** The good edit lost two tasks
-and tied two. Reading the responses says why, and it is not the missing context:
-both arms now quote the branch, the commit and the CI result out of the excerpt.
-The excerpt is a transcript, not a working directory — asked to explain a repo,
-the model has what an earlier turn *said* about the code, not the code — so an
-answer that marks that limit still reads to the judge as the hedging the rubric
-penalizes. That is the grounding defect in `build_task_rubric`, which was
-downstream of replay fidelity and is now the binding constraint.
+**Read the middle two rows together, because one sample separates them.** Raising
+the budgets alone appeared to cost 0.250 on the harmful arm. It did not: one
+baseline replay answered with a raw `read_file` tool call instead of an answer,
+scored 0.00, and lost to a 65-character bad-arm response. Delimiting the record
+fixed that reply — the same task now scores 1.00 and wins both orders — and the
+harmful arm returned to −0.500 with nothing else changed. A four-task run moves
+0.250 on a single contaminated response, which is the honest size of n = 4.
 
-So the gate is sound in the direction that matters for safety — it rejects harm —
-and cannot yet be used to accept an improvement on its own evidence.
+**The absolute judge reads +0.000 on the same run, and that is a ceiling, not a
+disagreement.** All four baselines now score 1.00, so there is no headroom left
+for the helpful edit to occupy; its earlier +0.250 was the contaminated baseline
+scoring 0.00, not a gain. Absolute still rates a 62-character answer 1.00 on one
+task where pairwise scores it a loss in both orders — the rubric's grounding
+defect is intact, and comparison is what contains it.
+
+Position bias is still real and still worth its cost: 1 of 4 helpful-arm
+comparisons returned whichever answer was shown first and was neutralised to a
+tie, so the +0.375 is what survived order-swapping rather than what a single
+order reported.
 
 ## Outcome labels
 
@@ -367,13 +395,12 @@ otherwise have scored the *helpful* edit a loss.
 n = 4 tasks on one skill. Small, and a wider separation on one draw is not a
 guarantee.
 
-Re-run on the tool-filtered pool, the harmful edit is caught the same way and the
-old pathology is gone: a seven-character answer now **loses both orders** on the
-task where a four-character one used to win. The helpful arm is inconclusive —
-the edit under test made responses shorter rather than better, and one of its
-replays declined for missing context, so that arm measured the context problem
-above rather than the edit. A clean test of a helpful edit needs the context fix
-first.
+Re-run on the tool-filtered pool with the excerpt filled, both arms land: the
+helpful edit separates **+0.375** and the harmful one **−0.500**, and the old
+pathology is gone — a 62-character answer that the absolute judge rates 1.00
+loses both orders under comparison. See "What filling it measured" for the four
+runs that got there and for the single response that made one of them look like a
+regression.
 
 ### Failures are loud
 
@@ -439,9 +466,11 @@ python -m venv /tmp/v020 && /tmp/v020/bin/pip install "skillopt==0.2.0" pytest -
   never requires it to be *right*. `"Yes."` is maximally direct, and an honest
   "I can't verify this" reads to the judge as the hedging the rubric penalizes.
   Until the rubric carries a grounding requirement, a confidently wrong edit can
-  still clear the gate. Filling `context_excerpt` removed the version of this
-  that came from missing context, and left the rubric defect itself standing as
-  the binding constraint — see "What filling it measured".
+  still clear the *absolute* judge, which rated a 62-character answer 1.00 on a
+  task the pairwise judge scored a loss in both orders. Filling `context_excerpt`
+  and delimiting it removed the version of this that came from missing context,
+  and comparison contains what is left; the rubric text itself is unfixed. Use
+  `--judge pairwise` — see "What filling it measured".
 - Skill attribution is session/turn based and depends on successful `skill_view` tool results.
 - Roughly half of mined turns are dropped as unreplayable. Optimizing a skill whose
   work is mostly tool-driven means optimizing the minority of it that is conversation.
